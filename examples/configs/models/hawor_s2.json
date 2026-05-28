@@ -1,0 +1,13 @@
+{
+  "variant": "hawor-s2-v0.3",
+  "refinement_iters": 50,
+  "smoothing_window": 7,
+  "batch_size": 8,
+  "fp16": true,
+  "mock_baseline_left_xyz": [-0.15, 0.05, 0.45],
+  "mock_baseline_right_xyz": [0.15, 0.05, 0.45],
+  "mock_translation_jitter_m": 0.01,
+  "mock_rot_std_rad": 0.3,
+  "mock_pose_std_rad": 0.15,
+  "mock_betas_std": 0.2
+}

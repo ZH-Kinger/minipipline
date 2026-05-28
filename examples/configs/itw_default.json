@@ -1,0 +1,22 @@
+{
+  "manifest_filename": "config.json",
+  "task_info_filename": "task_info.json",
+  "rgb_video_filename": "rgb_head.mp4",
+  "rgb_timestamps_filename": "rgb_head.csv",
+  "depth_video_filename": "depth_head.mkv",
+  "depth_timestamps_filename": "depth_head.csv",
+  "imu_filename": "imu.txt",
+  "audio_filename": "mic.wav",
+  "hand_keypoints_filename": "hands_keypoint_3d.json",
+  "head_6dof_candidates": ["head_hands_sixdof.csv", "head_hands_sixdof2.csv"],
+  "kalibr_filename": "kalibr_parameters.yaml",
+  "head_param_path": "camera_params/head_param.json",
+  "reference_stream": "rgb_head",
+  "nominal_fps": 30.0,
+  "gap_anomaly_factor": 1.6,
+  "audio_pad_ms": 0.0,
+  "tail_exclude": true,
+  "intrinsics_match_atol": 0.001,
+  "copy_video": false,
+  "shard_max_size_mb": 512
+}

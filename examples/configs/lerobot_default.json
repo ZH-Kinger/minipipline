@@ -1,0 +1,15 @@
+{
+  "codebase_version": "v3.0",
+  "robot_type": "ego_hand_vitra",
+  "video_key": "observation.images.ego",
+  "chunks_size": 1000,
+  "rows_per_shard": 100000,
+  "episodes_per_shard": 1000,
+  "video_codec": "h264",
+  "video_pix_fmt": "yuv420p",
+  "video_crf": 23,
+  "video_preset": "medium",
+  "enable_real_stats": false,
+  "strict_dim_validation": true,
+  "main_type_default": -1
+}

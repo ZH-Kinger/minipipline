@@ -1,0 +1,9 @@
+{
+  "variant": "hawor-s1-v0.3",
+  "batch_size": 8,
+  "detection_threshold": 0.5,
+  "max_seq_len": 1024,
+  "fp16": true,
+  "mock_present_prob": 0.7,
+  "mock_score_range": [0.6, 0.99]
+}

@@ -1,0 +1,9 @@
+{
+  "variant": "geocalib-v1",
+  "batch_size": 1,
+  "input_size": [384, 512],
+  "fp16": false,
+  "mock_hfov_deg": 76.0,
+  "mock_vfov_deg": 55.0,
+  "mock_fov_jitter_deg": 0.5
+}

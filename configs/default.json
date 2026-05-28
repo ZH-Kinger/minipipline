@@ -1,0 +1,58 @@
+{
+  "alignment_tolerance_ms": 50.0,
+  "annotation_confidence_threshold": 0.85,
+  "expected_streams": [],
+  "ignore_dirs": [
+    ".git",
+    "__pycache__",
+    ".venv",
+    "venv",
+    "processed"
+  ],
+  "manifest_file": null,
+  "modality_extensions": {
+    "audio": [
+      ".wav",
+      ".flac",
+      ".mp3",
+      ".aac"
+    ],
+    "depth": [
+      ".npy",
+      ".npz",
+      ".pfm",
+      ".exr",
+      ".tiff",
+      ".tif"
+    ],
+    "imu": [
+      ".json",
+      ".jsonl",
+      ".csv"
+    ],
+    "pointcloud": [
+      ".pcd",
+      ".ply",
+      ".bin",
+      ".las",
+      ".laz"
+    ],
+    "pose": [
+      ".json",
+      ".jsonl",
+      ".csv",
+      ".txt"
+    ],
+    "rgb": [
+      ".jpg",
+      ".jpeg",
+      ".png",
+      ".bmp",
+      ".webp"
+    ]
+  },
+  "reference_stream": "rgb",
+  "session_id": "default",
+  "shard_max_size_mb": 512,
+  "timestamp_regex": "(?P<timestamp>\\d{10,})"
+}

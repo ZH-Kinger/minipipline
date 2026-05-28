@@ -1,0 +1,23 @@
+{
+  "mock_scheme_version": "v1",
+  "mock_seed_salt": "multimodal_pipeline.handpose.mock",
+  "executor_mode": "thread",
+  "max_workers": 4,
+  "max_clip_parallel": 2,
+  "clip_len_s": 30.0,
+  "clip_overlap_s": 2.0,
+  "blend_window_frames": 30,
+  "long_video_threshold_s": 30.0,
+  "target_fps": 30.0,
+  "allow_resample": false,
+  "mano_pose_dim": 45,
+  "mano_betas_dim": 10,
+  "max_invalid_run_frames": 5,
+  "smoothing_window_frames": 5,
+  "velocity_min_window": 5,
+  "velocity_min_eps": 0.01,
+  "min_atomic_frames": 5,
+  "fallback_split_count": 1,
+  "save_raw_predictions": true,
+  "save_cleaned_predictions": true
+}

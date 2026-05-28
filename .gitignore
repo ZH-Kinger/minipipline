@@ -1,0 +1,21 @@
+__pycache__/
+.pytest_cache/
+.venv/
+venv/
+*.egg-info/
+data/processed/
+dist/
+build/
+
+# CLI default output root and explicit user-facing outputs.
+output/
+
+# IDE / tooling state.
+.idea/
+.claude/
+.vscode/
+
+# Local environment overrides (see .env.example for the template).
+.env
+.env.local
+logs/

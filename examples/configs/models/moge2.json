@@ -1,0 +1,11 @@
+{
+  "variant": "moge2-base",
+  "batch_size": 4,
+  "max_image_size": 1024,
+  "depth_clip_m": [0.3, 5.0],
+  "fp16": true,
+  "mock_height": 24,
+  "mock_width": 32,
+  "mock_disparity_range": [0.1, 1.0],
+  "mock_depth_clip_m": [0.3, 1.5]
+}
