@@ -368,6 +368,28 @@ def _run_one_session(
     layer1_root = per_session_output
     layer3_root = per_session_output / "lerobot_dataset"
 
+    from .config import settings
+
+    def _backend_summary(slots: tuple[str, ...], fallback_key: str) -> str:
+        seen = []
+        for s in slots:
+            try:
+                seen.append(settings.backend(s, fallback_key=fallback_key))
+            except ValueError:
+                seen.append("?")
+        if all(b == seen[0] for b in seen):
+            return seen[0]
+        return ",".join(f"{s}={b}" for s, b in zip(slots, seen))
+
+    hp_backends = _backend_summary(
+        ("geocalib", "moge2", "hawor_s1", "megasam", "hawor_s2"),
+        fallback_key="HANDPOSE_BACKEND",
+    )
+    an_backends = _backend_summary(
+        ("language", "actions", "quality"),
+        fallback_key="ANNOTATOR_BACKEND",
+    )
+
     print("  [Layer 1] ingest ...")
     l1 = run_itw_ingest(session_dir, layer1_root, itw_cfg, pack_tar=True)
     print(
@@ -377,14 +399,14 @@ def _run_one_session(
         f"errors={l1.report.validation.error_count}"
     )
 
-    print("  [Layer 2] handpose (mock) ...")
+    print(f"  [Layer 2] handpose [{hp_backends}] ...")
     l2 = run_handpose_pipeline(l1.session.root, hp_cfg)
     print(
         f"    -> {l2.video.n_frames} frames, {len(l2.atomic_actions)} atomic actions, "
         f"merged_valid={int(l2.merged.pred_valid.sum())}/{l2.video.n_frames * 2}"
     )
 
-    print("  [Layer 1.5] annotate (mock) ...")
+    print(f"  [Layer 1.5] annotate [{an_backends}] ...")
     la = run_annotate_pipeline(l1.session.root, annotate_cfg, atomic_actions=l2.atomic_actions)
     kept = sum(1 for r in la.frame_quality if r.kept)
     print(
