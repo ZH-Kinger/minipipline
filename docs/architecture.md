@@ -4,7 +4,7 @@
 
 将 ITW（In-The-Wild）人类示范会话原始数据，端到端转换为可直接用于 VLA/模仿学习训练的 LeRobot v3 标准数据集。
 
-## 三层叠加架构
+## 4 层叠加架构
 
 ```
 原始 ITW 会话目录
@@ -12,17 +12,28 @@
        ▼  Layer 1 (multimodal_pipeline.itw)
    NIR + WebDataset tar
        │
-       ▼  Layer 2 (multimodal_pipeline.handpose, 当前 mock)
-   MergedPrediction + AtomicActions
-       │
-       ▼  Layer 3 (multimodal_pipeline.lerobot_v3)
-   LeRobot v3 数据集
+       ├──────────────────────────────┐
+       ▼                              ▼
+  Layer 2 (handpose)            Layer 1.5 (annotate)
+  MergedPrediction +            ClipAnnotation +
+  AtomicActions                 FrameQualityRow
+  （mock | real backend）        （mock | dashscope | rule_based）
+       │                              │
+       └──────────────┬───────────────┘
+                      ▼
+            Layer 3 (lerobot_v3)
+            LeRobot v3 数据集
+            （tasks 来自 clip 语言，
+              data 含 action_label/score 列）
 ```
 
-每层有**独立的输入输出契约**，因此可以独立替换实现：
+每层有**独立的输入输出契约**，可以独立替换实现：
 - Layer 1 未来可加 USD/Omniverse 导出
-- Layer 2 接入真实的 GeoCalib / MoGe-2 / HaWoR / MegaSAM 模型权重时不影响上下游
+- Layer 2 接入真实 GeoCalib / MoGe-2 / HaWoR / MegaSAM 模型权重时不影响上下游
+- Layer 1.5 可换 VLM（Qwen-VL / GPT-4o / 本地模型），可替换 quality（OpenCV / 训练分类器）
 - Layer 3 输出格式可以从 LeRobot v3 切换到 RLDS / WebDataset / 任意其他格式
+
+**Layer 2 与 Layer 1.5 都直接消费 NIR，互相独立**。当 atomic_actions 来自 Layer 2 时，Layer 1.5 把它们当作 clip 边界打标（语义对齐）；若 Layer 2 没跑，Layer 1.5 退化为按固定窗口切 clip。
 
 ## Layer 1 — ITW Ingest (`multimodal_pipeline.itw`)
 
@@ -50,6 +61,37 @@
 3. **异常标记**：自动检测 frame gap（默认 > nominal 1.6 倍 → anomaly）
 4. **手部有效性**：处理 tail-excluded 帧、前段无关键点段
 5. **校准跨校验**：kalibr ↔ head_param.json 的 K 矩阵一致性
+
+## Layer 1.5 — Annotation (`multimodal_pipeline.annotate`)
+
+**输入**：NIR 会话目录 + 可选 `list[AtomicAction]`（来自 Layer 2）。
+
+**输出**（写回 NIR 目录）：
+
+| 文件 | 内容 |
+|------|------|
+| `clip_annotations.parquet` | 每个 atomic clip 一行：`clip_idx`, `frame_start/end`, `t_start/end_s`, `language_text`, `action_label`, `action_score`, `language_source`, `actions_source` |
+| `frame_quality.parquet` | 每帧一行：`frame_idx`, `blur_score`, `exposure_score`, `hand_visible`, `overall_quality`, `kept` |
+
+**3 个独立 component 与 backend**：
+
+| component | 可选 backend | 说明 |
+|-----------|------------|------|
+| `language`（clip 描述） | `mock` / `dashscope` | mock 返回模板字符串；dashscope 走阿里云 Qwen-VL REST，stdlib `urllib` 实现，无 SDK 依赖 |
+| `actions`（clip 类别） | `mock` / `dashscope` | mock 随机从 7 类（reach/grasp/lift/move/rotate/place/release）选；dashscope 用同样 VLM 0-shot 分类，结果归一化到该 vocab |
+| `quality`（每帧质量） | `mock` / `rule_based` | mock 出确定性随机值；rule_based 用 ffmpeg 解码灰度帧 + 4-邻域 Laplacian 方差（无 cv2 依赖）算模糊，灰度均值算曝光 |
+
+**模型与成本**（DashScope，参考阿里云公开价）：
+
+| 模型 | 单价（每图） | 19 clip × 16 帧 单 session 全开 language+actions 成本 |
+|------|------------|------------------------------------------------|
+| `qwen-vl-plus` | ~¥0.008 | ~¥4.8 |
+| `qwen-vl-max` | ~¥0.02  | ~¥12 |
+
+**关键约定**：
+- mock 与 dashscope 用同一 BLAKE2b seed scheme，所以连续两次跑 mock 的 `clip_annotations` 字段 byte-identical
+- DashScope backend 在 `__post_init__` 里 eager-check `MMPIPE_DASHSCOPE_API_KEY`，fail-fast，不会做完一半才发现没 key
+- action_score 在 dashscope backend 是固定 0.8（VLM 不返回真实概率），mock 是 `uniform(0.6, 0.95)`；下游使用方应避免把它当作精确置信度
 
 ## Layer 2 — Hand Pose Features (`multimodal_pipeline.handpose`)
 
@@ -104,15 +146,24 @@
 |--------|---------|
 | ITW → NIR | parquet + npz + wav + json |
 | NIR → Layer 2 | 通过 `media_paths.json` 找回源视频 |
+| NIR → Layer 1.5 | 同上，外加可选 `list[AtomicAction]`（Layer 2 输出）作 clip 边界 |
 | Layer 2 → Layer 3 | `MergedPrediction (numpy)` + `list[AtomicAction]` |
+| Layer 1.5 → Layer 3 | `list[ClipAnnotation]` → 写入 `task` 字段（per-clip 语言）+ data parquet 的 `action_label` / `action_score` 列 |
 | Layer 3 → 训练 | 标准 LeRobot v3 datasets API |
 
 ## Mock 确定性
 
-所有 Layer 2 mock 输出由 `BLAKE2b((scheme_version, salt, video_sha1, stage, frame_idx, slot))` 派生种子，保证：
+Layer 2 和 Layer 1.5 的 mock backends 都用**同一套** BLAKE2b 派生 seed 方案：
+
+- Layer 2 key: `(scheme_version, salt, video_sha1, stage, frame_idx, slot)`
+- Layer 1.5 key: `(scheme_version, salt, video_sha1, stage, clip_idx | frame_idx)`
+
+两者都保证：
 - **线程无关**：并发执行不改变结果
-- **重跑一致**：同一输入连续两次 `run-all` 产出 byte-identical 的 state 张量
+- **重跑一致**：同一输入连续两次 `run-all` 产出 byte-identical 的 state 张量 + clip_annotations
 - **版本可控**：升级 mock 时改 `mock_scheme_version`（默认 `"v1"`）即可使所有下游 cache 失效
+
+DashScope 等真实 backend 当然**不确定**（受温度参数 + 服务端随机性影响）。
 
 ## 真实数据契约（基于 `00010a33-...` 验证）
 
@@ -130,8 +181,11 @@
 
 | 扩展 | 修改点 | 触发条件 |
 |------|--------|---------|
-| 接入真实 HaWoR 等模型 | 替换 `handpose/models/*.py` 中的 `infer` 实现 | 拿到模型权重 + GPU 环境 |
-| 多会话批处理 | CLI 加 `--batch-root`，循环遍历 | 数据量 > 1 个会话 |
+| 接入真实 HaWoR 等 5 个模型 | 替换 `handpose/models/*.py` 中的 `infer` 实现 + `build_*_backend` factory 加分支 | 拿到模型权重 + GPU 环境 |
+| 接入本地 Qwen-VL（不走 API） | `annotate/language.py` + `annotate/actions.py` 加 `LocalQwenVlAnnotator`，pyproject 加 `transformers` extra | 想离线跑 / 数据敏感不发外网 |
+| 加身体 3D 关键点 | 新增 `annotate/body_pose.py`（NLF / 4DHumans），orchestrator 串入，schema 加 `body_keypoints.parquet` | 需求落地 |
+| 加物体 6DoF | 新增 `annotate/object_pose.py`（FoundationPose），同上 | 需求落地 |
+| 多会话批处理 | 已支持：`mmpipe <parent_dir>` 自动检测 + 断点续跑 | — |
 | USD/Omniverse 导出 | 新增 `multimodal_pipeline.usd` 子包，消费 NIR | 需求落地 |
 | 真实 stats.json | `LeRobotConfig.enable_real_stats=True` | 真实数据接入 |
 | Ray / K8s 编排 | 见 ADR-0001 退出准则 | 数据量 > 100GB 或团队 > 3 人 |
@@ -144,22 +198,36 @@
 - [x] NIR `frame_index.parquet` 行数 = 257
 - [x] IMU 裁剪后样本数 ≈ 200 × 8.57 = 1714（实测 1722）
 - [x] Audio 裁剪后时长 ≈ 8.567s（实测 412798 / 48000 = 8.60s）
+- [x] NIR `clip_annotations.parquet` 行数 = `len(atomic_actions)`（实测 19）
+- [x] NIR `frame_quality.parquet` 行数 = NIR 帧数（实测 257）
+- [x] `clip_annotations` 中 `language_source` / `actions_source` 与当前 `.env` backend 设置一致
 - [x] LeRobot v3 `info.json` 字段齐全（codebase_version=v3.0, robot_type, fps, splits, features）
+- [x] LeRobot v3 data parquet 含 `action_label`（string）+ `action_score`（float32）列
+- [x] LeRobot v3 `tasks.parquet` 是去重后的 per-clip 语言（不再只有 session-level）；实测 19 个 atomic clip → 6 ~ 17 个去重任务（取决于 backend 是 mock 还是真 VLM）
 - [x] 每个 episode 的 parquet 行数 = 视频帧数（ffprobe 校验，±1 帧容忍）
 - [x] `state` 向量 float32[122]，符合 STATE_LAYOUT
 - [x] `lerobot-validate` 0 errors / 0 warnings
 
 ## CLI 参考
 
-```powershell
-# 三层连跑（推荐）
-python -m multimodal_pipeline run-all <session_dir> <output_root>
+云端 Linux 推荐用 `mmpipe`（pip 安装后的 console_script）；本地 Windows + Python 3.14 上 console_script 有已知问题，改用 `python -m multimodal_pipeline ...` 即可。
+
+```bash
+# 端到端（4 层连跑，推荐）
+mmpipe <session_dir>                          # 默认输出到 ./output/<basename>/
+mmpipe <session_dir> <output_root>            # 显式输出根
+mmpipe <parent_dir> <output_root>             # 批量：自动扫一级子 session，断点续跑
 
 # 单层独跑
-python -m multimodal_pipeline ingest <session_dir> <output_dir>
-python -m multimodal_pipeline handpose <nir_dir>
-python -m multimodal_pipeline lerobot <nir_dir> <dataset_root>
-python -m multimodal_pipeline lerobot-validate <dataset_root>
+mmpipe ingest <session_dir>                   # 仅 Layer 1
+mmpipe handpose <nir_dir>                     # 仅 Layer 2
+mmpipe annotate <nir_dir>                     # 仅 Layer 1.5
+mmpipe lerobot <nir_dir>                      # Layer 2 + 3
+
+# 工具
+mmpipe doctor                                 # 自检 ffmpeg / 依赖 / backend / 凭据
+mmpipe info <dataset_root>                    # 摘要数据集（episodes/frames/sizes）
+mmpipe validate <dataset_root>                # 读回校验数据集合规
 ```
 
 ## 配置分层
@@ -167,10 +235,12 @@ python -m multimodal_pipeline lerobot-validate <dataset_root>
 ```
 multimodal_pipeline/config/                # 代码即配置（算法层）
 ├── settings.py                            # Settings 单例：读 .env，暴露 device/backend/weights/...
-├── itw.py / handpose.py / lerobot.py      # 每层算法参数 dataclass（默认值入 git）
+├── itw.py / handpose.py / annotate.py / lerobot.py    # 每层算法参数 dataclass（默认值入 git）
 ├── legacy.py                              # 老版 PipelineConfig（sensor-ETL）
 └── models/                                # 单模型算法超参 dataclass
     ├── geocalib.py / moge2.py / hawor_s1.py / megasam.py / hawor_s2.py
+    ├── qwen_vl.py                         # Layer 1.5 语言+动作模型超参（prompt/温度/帧数）
+    ├── quality.py                         # Layer 1.5 质量阈值（blur/exposure）
     └── _base.py                           # 共享 from_file/from_mapping mixin
 
 examples/configs/                          # JSON 模板（可选 --*-config override）
@@ -191,8 +261,15 @@ examples/configs/                          # JSON 模板（可选 --*-config ove
 | 输入输出路径（每次跑变） | CLI 参数 | `session_dir`, `output_root` |
 | 上述算法层的 ad-hoc 覆盖 | `examples/configs/*.json` + `--*-config` 可选传入 | 比如想试改 `clip_len_s` 而不动代码 |
 
-**Backend dispatch**：`multimodal_pipeline.handpose.models.build_<name>_backend(cfg)` 读 `settings.backend("<name>")`：
+**Backend dispatch**（Layer 2）：`multimodal_pipeline.handpose.models.build_<name>_backend(cfg)` 读 `settings.backend("<name>", fallback_key="HANDPOSE_BACKEND")`：
 - `mock`（默认）→ 返回 mock 实现
 - `real` → 抛 `NotImplementedError`（含 env var 提示），接入真实模型时把分支补上即可
 
 `MMPIPE_HANDPOSE_BACKEND` 是 5 个 slot 的全局默认；`MMPIPE_<SLOT>_BACKEND` 覆盖之。
+
+**Backend dispatch**（Layer 1.5）：`multimodal_pipeline.annotate.{language,actions,quality}.build_*_backend(cfg)` 读 `settings.backend("<component>", fallback_key="ANNOTATOR_BACKEND")`：
+- `language` 接受：`mock` | `dashscope`
+- `actions`  接受：`mock` | `dashscope`
+- `quality`  接受：`mock` | `rule_based`
+
+`MMPIPE_ANNOTATOR_BACKEND` 是 3 个 component 的全局默认；`MMPIPE_<COMPONENT>_BACKEND` 覆盖之。语言/动作走 `dashscope` 时还需要 `MMPIPE_DASHSCOPE_API_KEY`，未填会在 backend `__post_init__` 抛 `DashScopeError`，不会做完 ffmpeg 抽帧才发现。

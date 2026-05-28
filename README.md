@@ -1,12 +1,13 @@
 # Multimodal Embodied-AI Data Pipeline
 
-通用多模态人类示范数据管线。三层叠加架构：
+通用多模态人类示范数据管线。**4 层叠加架构**：
 
-1. **Layer 1 (ITW Ingest)** — 从原始会话目录摄取多模态文件，时间对齐、坐标统一、有效性标记，输出 NIR + WebDataset tar
-2. **Layer 2 (Hand Pose Features, 当前 mock)** — 7 阶段模型链（GeoCalib + MoGe-2 + HaWoR + MegaSAM）输出手部 MANO 参数与相机轨迹
-3. **Layer 3 (LeRobot v3 Pack)** — 装配为 LeRobot v3 标准数据集，附 dataloader 读回校验
+1. **Layer 1 — ITW Ingest** — 从原始会话目录摄取多模态文件，时间对齐、坐标统一、有效性标记，输出 NIR + WebDataset tar
+2. **Layer 2 — Hand Pose Features**（当前 mock，可切真模型）— 7 阶段模型链（GeoCalib + MoGe-2 + HaWoR + MegaSAM）输出手部 MANO 参数与相机轨迹
+3. **Layer 1.5 — Annotate**（mock / DashScope Qwen-VL / OpenCV-style）— 给每个 atomic clip 贴语言描述 + 动作类别；给每帧打模糊/曝光质量分（3 个 component：`language` / `actions` / `quality`）
+4. **Layer 3 — LeRobot v3 Pack** — 装配为 LeRobot v3 标准数据集，含 per-clip 语言、per-frame `action_label` / `action_score`，附 dataloader 读回校验
 
-依赖：`numpy>=1.26`、`pyarrow>=15.0`、`pyyaml>=6.0` + 系统 ffmpeg。
+依赖：`numpy>=1.26`、`pyarrow>=15.0`、`pyyaml>=6.0` + 系统 ffmpeg（其余真实模型按需，纯 mock 跑不需要 GPU 或 torch）。
 
 完整架构与数据契约见 [docs/architecture.md](docs/architecture.md)。
 
@@ -19,10 +20,13 @@
 | `multimodal_pipeline/config/{itw,handpose,lerobot}.py` | 算法/编排参数的 dataclass 默认值（如 `nominal_fps`、`clip_len_s`、`STATE_DIM`） | 是 |
 | `multimodal_pipeline/config/models/<name>.py` | 单模型算法私有超参（variant / batch_size / mock 行为） | 是 |
 | `examples/configs/*.json` + `examples/configs/models/*.json` | 上述 dataclass 的 JSON 模板，**仅作示例**，可选传给 `--*-config <path>` 覆盖 | 是 |
-| `.env`（拷贝自 `.env.example`） | 真实环境参数：`MMPIPE_DEVICE` / `MMPIPE_<MODEL>_BACKEND` / `MMPIPE_<MODEL>_WEIGHTS` / `MMPIPE_FFMPEG_PATH` / 凭据等 | **否**（`.gitignore`） |
+| `.env`（拷贝自 `.env.example`） | 真实环境参数：`MMPIPE_DEVICE` / `MMPIPE_OUTPUT_ROOT` / Layer 2 的 `MMPIPE_<MODEL>_BACKEND` + `MMPIPE_<MODEL>_WEIGHTS` / Layer 1.5 的 `MMPIPE_LANGUAGE_BACKEND` / `MMPIPE_ACTIONS_BACKEND` / `MMPIPE_QUALITY_BACKEND` / `MMPIPE_DASHSCOPE_API_KEY` / 凭据等 | **否**（`.gitignore`） |
 | CLI 参数 | 每次跑变的输入输出路径 | — |
 
-切换 mock → real：在 `.env` 中设 `MMPIPE_<MODEL>_BACKEND=real` + `MMPIPE_<MODEL>_WEIGHTS=/path/to/weights`，real 实现未接入时会抛 `NotImplementedError` 含清晰提示。
+切换 mock → real（举例）：
+- Layer 2 单个模型：`MMPIPE_HAWOR_S1_BACKEND=real` + `MMPIPE_HAWOR_S1_WEIGHTS=/models/hawor_s1.pt`（real 实现未接入时会抛 `NotImplementedError` 含清晰提示）
+- Layer 1.5 语言标注走真模型：`MMPIPE_LANGUAGE_BACKEND=dashscope` + `MMPIPE_DASHSCOPE_API_KEY=sk-...`（已接通 Qwen-VL，下面有详细用法）
+- Layer 1.5 帧质量走真规则：`MMPIPE_QUALITY_BACKEND=rule_based`（用 ffmpeg + Laplacian 方差，无需额外依赖）
 
 ## 快速开始
 
@@ -68,33 +72,124 @@ mmpipe info <dataset_root>             # 数据集摘要
 
 ## 云端部署典型用法（阿里云 ECS/DSW + OSS）
 
-OSS 挂载到本地路径后，把固定的输出根目录写进 `.env`：
+### 1. 准备环境（首次部署）
+
+ECS（推荐 Ubuntu 22.04，GPU 实例若要跑真实模型；纯 mock + DashScope API 走 CPU 实例即可）：
 
 ```bash
-# .env
-MMPIPE_OUTPUT_ROOT=/mnt/oss-output/processed/
-MMPIPE_DEVICE=cuda:0
+# 系统依赖
+sudo apt-get update && sudo apt-get install -y python3.11 python3.11-venv ffmpeg git
+
+# 拉代码
+git clone https://github.com/ZH-Kinger/minipipline.git
+cd minipipline
+
+# 装包（建议虚拟环境）
+python3.11 -m venv .venv
+source .venv/bin/activate
+pip install -e .
 ```
 
-之后输入路径直接传 OSS 挂载点，无须每次写输出：
+DSW（PAI-DSW）镜像通常自带 Python + ffmpeg，只需 `pip install -e .`。
+
+### 2. 挂载 OSS
+
+阿里云提供 3 种主流方式，按场景选：
+
+| 方式 | 适用 | 注意 |
+|------|------|------|
+| **ossfs** | ECS 自管 | 装 [ossfs](https://help.aliyun.com/zh/oss/developer-reference/install-and-update-ossfs)，POSIX 接口，写性能有限 |
+| **OSSPath**（DSW 自带） | PAI-DSW | 创建 DSW 时直接挂载 OSS 数据集 |
+| **JindoSDK / Jindofs** | 大量随机读写 | 性能比 ossfs 好，配置稍复杂 |
+
+挂载后假设输入桶在 `/mnt/oss-input/`，输出桶在 `/mnt/oss-output/`。
+
+### 3. 配置 `.env`
 
 ```bash
-# 跑单个 session
+cp .env.example .env
+# 用任意编辑器（vim / nano / VS Code Remote）改下列项：
+```
+
+```bash
+# 输出根目录（一次写好，省得每次传 CLI 参数）
+MMPIPE_OUTPUT_ROOT=/mnt/oss-output/processed/
+
+# 设备
+MMPIPE_DEVICE=cuda:0           # GPU；CPU 实例改成 cpu
+
+# Layer 1.5 — 走真模型 + 真质量
+MMPIPE_LANGUAGE_BACKEND=dashscope
+MMPIPE_ACTIONS_BACKEND=dashscope
+MMPIPE_QUALITY_BACKEND=rule_based
+MMPIPE_DASHSCOPE_API_KEY=sk-你的真实key
+MMPIPE_DASHSCOPE_MODEL=qwen-vl-max     # 或 qwen-vl-plus（便宜约 2.5×）
+
+# Layer 2 — 暂时全 mock（接真模型时改对应行 + 填 weights 路径）
+MMPIPE_HANDPOSE_BACKEND=mock
+```
+
+DashScope API key 在 [DashScope 控制台](https://dashscope.console.aliyun.com/apiKey) 创建。
+
+### 4. Pre-flight 自检
+
+```bash
+mmpipe doctor
+```
+
+期望全绿。如果 Layer 1.5 那块某个 component 红了，说明对应 backend 切了真但凭据没填——按提示补 `.env`。
+
+### 5. 跑数据
+
+```bash
+# 单个 session（OSS 挂载点直接传）
 mmpipe /mnt/oss-input/session_xyz
 # → /mnt/oss-output/processed/session_xyz/lerobot_dataset/
 
-# 批量整个 OSS 桶
+# 批量整个 OSS 输入桶（自动扫一级子目录里所有 session）
 mmpipe /mnt/oss-input/
-# → /mnt/oss-output/processed/<session_basename>/ 每个 session 一份
+# → /mnt/oss-output/processed/<basename>/ 一份一份落
 ```
 
-中断后重跑等价于断点续跑 —— 已完成的 session 跳过，未完成的继续。
+**断点续跑**：批量模式下，若 `<output>/<basename>/lerobot_dataset/meta/info.json` 已存在，自动 SKIP 该 session。中断后再跑一遍同样命令即可继续。
+
+### 6. 常见错误
+
+| 报错 | 排查 |
+|------|------|
+| `FFmpegMissingError` | ECS 没装 ffmpeg：`sudo apt-get install ffmpeg`；或在 `.env` 加 `MMPIPE_FFMPEG_PATH=/path/to/ffmpeg` |
+| `DashScopeError: MMPIPE_DASHSCOPE_API_KEY is not set` | `.env` 里 key 行没填或拼错；`source .env` 可能没生效，Python 读的是文件不是 shell env |
+| OSS 写入 `OSError: [Errno 30] Read-only file system` | 挂载选项没开写；ossfs 加 `-o allow_other,umask=0022,mp_umask=0022` |
+| `ModuleNotFoundError: multimodal_pipeline` | 没在虚拟环境里 / 忘了 `pip install -e .` |
+| 跑得很慢 / 大量 timeout | OSS 随机读写慢，考虑 JindoSDK；或把输入 session 先 `cp -r` 到本地盘再跑 |
+
+## 标注后端怎么选
+
+Layer 1.5 三个 component 可独立切，按场景挑：
+
+| component | 选什么 | 适用 | 单 session 成本 |
+|-----------|--------|------|---------------|
+| `language` | `mock` | 调链路 / 不想花钱 | 0 |
+|  | `dashscope` + `qwen-vl-plus` | 日常生产，能用 | ~¥2.4 / 19 clip |
+|  | `dashscope` + `qwen-vl-max` | 想要更准更长描述 | ~¥6 / 19 clip |
+| `actions` | `mock` | 不在乎类别准 / 后续自己训分类器 | 0 |
+|  | `dashscope` | 想要 reach/grasp/lift 等真实类别 | ~¥2.4 / 19 clip |
+| `quality` | `mock` | 反正全保留 | 0 |
+|  | `rule_based` | **推荐默认开**，纯 ffmpeg+numpy，无新依赖 | 0（本地算） |
+
+跑通主路径 + 控制成本的推荐配置：
+```bash
+MMPIPE_LANGUAGE_BACKEND=dashscope
+MMPIPE_DASHSCOPE_MODEL=qwen-vl-plus
+MMPIPE_ACTIONS_BACKEND=mock          # action 类别在训练阶段不一定要
+MMPIPE_QUALITY_BACKEND=rule_based
+```
 
 ---
 
 ## 旧版 sensor-ETL 管线（保留）
 
-下方为初版基于 stdlib 的传感器文件 ETL，与上述三层管线并存。
+下方为初版基于 stdlib 的传感器文件 ETL，与上述 4 层管线并存。
 
 这个项目把已经采样好的 RGB、Depth、IMU、Pose、音频、点云等散装文件，流程化处理成可训练的数据包。
 
