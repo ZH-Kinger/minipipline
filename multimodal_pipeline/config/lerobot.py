@@ -27,8 +27,12 @@ class LeRobotConfig:
     # Video encoding (per-episode .mp4).
     video_codec: str = "h264"
     video_pix_fmt: str = "yuv420p"
-    video_crf: int = 23
+    video_crf: int = 20                # 23→20: PSNR-Y +~1.5dB, files ~+35%
     video_preset: str = "medium"
+    video_tune: str = "film"           # "" disables; "film" suits live-action ego video
+    video_force_fps: bool = False      # True restores legacy `-vf fps=<fps>` resample
+    video_workers: int = 3             # parallel ffmpeg subprocesses; 0 = auto (cpu//4)
+    video_x264_threads: int = 2        # per-ffmpeg x264 thread cap; balances vs video_workers
 
     # Stats: keep occupied-but-placeholder values per spec; real Welford runs
     # only when enabled.

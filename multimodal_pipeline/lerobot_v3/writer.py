@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
@@ -146,6 +148,18 @@ class LeRobotV3DatasetWriter:
         self._total_frames = 0
         self._video_size: tuple[int, int] | None = None  # (H, W)
 
+        # Episode video encoding runs in parallel: per-episode ffmpeg subprocesses
+        # are CPU-bound external work; threads here avoid pickling numpy payloads
+        # while still letting multiple ffmpegs run concurrently.
+        workers = cfg.video_workers if cfg.video_workers > 0 else max(1, (os.cpu_count() or 4) // 4)
+        self._encode_pool = ThreadPoolExecutor(
+            max_workers=workers, thread_name_prefix="mmpipe-encode"
+        )
+        self._encode_futures: dict[int, Future[tuple[int, int]]] = {}
+        # Source W/H cache: source W/H == output W/H (no scale filter), so probe
+        # each source video at most once across all its episodes.
+        self._source_wh: dict[Path, tuple[int, int]] = {}
+
         self._state_stats = StatsAccumulator(
             dim=STATE_DIM, name="observation.state", enabled=cfg.enable_real_stats
         )
@@ -160,6 +174,10 @@ class LeRobotV3DatasetWriter:
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
+        # If we never reached finalize() (e.g., exception in caller), make sure
+        # the encoder pool is torn down so we don't dangle worker threads.
+        if not self._encode_pool._shutdown:  # type: ignore[attr-defined]
+            self._encode_pool.shutdown(wait=False, cancel_futures=True)
         return None
 
     def register_task(self, text: str) -> int:
@@ -253,16 +271,22 @@ class LeRobotV3DatasetWriter:
         if self._action_stats.enabled:
             self._action_stats.update(np.zeros((T, ACTION_DIM), dtype=np.float32))
 
-        # 6. Episode video re-encode via ffmpeg.
+        # 6. Episode video re-encode via ffmpeg (submitted to the parallel pool;
+        #    result harvested in finalize()).
         video_relpath = (
             f"videos/{self.cfg.video_key}/chunk-000/"
             f"episode_{ep.episode_index:06d}.mp4"
         )
         video_path = self.root / video_relpath
-        height, width = self._encode_episode_video(ep, video_path)
+        # Path is deterministic — record now so order is preserved even if
+        # encoding completes out of order.
         self._video_files.append(video_relpath)
-        if self._video_size is None:
-            self._video_size = (height, width)
+        # Populate source W/H cache from the caller thread (single-threaded) so
+        # the encoder thread can do a lock-free dict lookup later.
+        self._ensure_source_wh(ep.source_video_path)
+        self._encode_futures[int(ep.episode_index)] = self._encode_pool.submit(
+            self._encode_episode_video, ep, video_path
+        )
 
         # 7. Episode index row.
         ep_global_end = ep_global_start + T
@@ -286,29 +310,16 @@ class LeRobotV3DatasetWriter:
         self._next_global_index = ep_global_end
         self._total_frames += T
 
-    def _encode_episode_video(self, ep: EpisodeInput, dst: Path) -> tuple[int, int]:
-        t_start = ep.frame_start / ep.source_fps
-        duration = ep.length / ep.source_fps
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        tmp = dst.with_suffix(".partial.mp4")
-        cmd = [
-            str(self._ffmpeg.ffmpeg),
-            "-y",
-            "-loglevel", "error",
-            "-ss", f"{t_start:.6f}",
-            "-i", str(ep.source_video_path),
-            "-t", f"{duration:.6f}",
-            "-vf", f"fps={self.fps}",
-            "-c:v", "libx264",
-            "-preset", self.cfg.video_preset,
-            "-crf", str(self.cfg.video_crf),
-            "-pix_fmt", self.cfg.video_pix_fmt,
-            "-an",
-            str(tmp),
-        ]
-        subprocess.run(cmd, check=True, capture_output=True)
-        tmp.replace(dst)
-        # ffprobe to fill height/width for info.json.
+    def _ensure_source_wh(self, source_path: Path) -> tuple[int, int]:
+        """Cache (H, W) for a source video. Called from the caller thread before
+        submitting an encode job, so the encoder thread sees a populated cache.
+
+        Source W/H equals output W/H (no scale filter), so we skip the per-clip
+        ffprobe on the encoded output entirely.
+        """
+        cached = self._source_wh.get(source_path)
+        if cached is not None:
+            return cached
         probe = subprocess.run(
             [
                 str(self._ffmpeg.ffprobe),
@@ -316,7 +327,7 @@ class LeRobotV3DatasetWriter:
                 "-select_streams", "v:0",
                 "-show_entries", "stream=width,height",
                 "-of", "json",
-                str(dst),
+                str(source_path),
             ],
             check=True,
             capture_output=True,
@@ -324,7 +335,52 @@ class LeRobotV3DatasetWriter:
         )
         info = json.loads(probe.stdout)
         stream = info.get("streams", [{}])[0]
-        return int(stream.get("height", 0)), int(stream.get("width", 0))
+        wh = (int(stream.get("height", 0)), int(stream.get("width", 0)))
+        self._source_wh[source_path] = wh
+        return wh
+
+    def _encode_episode_video(self, ep: EpisodeInput, dst: Path) -> tuple[int, int]:
+        t_start = ep.frame_start / ep.source_fps
+        duration = ep.length / ep.source_fps
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        tmp = dst.with_suffix(".partial.mp4")
+        # Build cmd:
+        #   -i SRC -ss T_START -t DUR   (output seek = frame-accurate)
+        #   [-vf fps=FPS]                (only when video_force_fps is set)
+        #   libx264 + crf/preset/tune    (quality knobs)
+        #   -threads N                   (cap x264 threads per process to play
+        #                                 well with the outer ThreadPool)
+        #   -x264-params keyint=...      (lock GOP, ensure frame 0 is I-frame
+        #                                 so dataloader random-access works)
+        cmd: list[str] = [
+            str(self._ffmpeg.ffmpeg),
+            "-y",
+            "-loglevel", "error",
+            "-i", str(ep.source_video_path),
+            "-ss", f"{t_start:.6f}",
+            "-t", f"{duration:.6f}",
+        ]
+        if self.cfg.video_force_fps:
+            cmd += ["-vf", f"fps={self.fps}"]
+        cmd += [
+            "-c:v", "libx264",
+            "-preset", self.cfg.video_preset,
+            "-crf", str(self.cfg.video_crf),
+        ]
+        if self.cfg.video_tune:
+            cmd += ["-tune", self.cfg.video_tune]
+        cmd += [
+            "-pix_fmt", self.cfg.video_pix_fmt,
+            "-threads", str(max(1, self.cfg.video_x264_threads)),
+            "-x264-params", "keyint=30:min-keyint=30:scenecut=0",
+            "-an",
+            str(tmp),
+        ]
+        subprocess.run(cmd, check=True, capture_output=True)
+        tmp.replace(dst)
+        # Return cached source (H, W) — same as the just-written file because we
+        # didn't apply any scale filter.
+        return self._source_wh.get(ep.source_video_path, (0, 0))
 
     def _write_data_shard(self) -> None:
         if not self._data_rows:
@@ -399,6 +455,26 @@ class LeRobotV3DatasetWriter:
     def finalize(self) -> DatasetReport:
         if not self._episodes:
             raise RuntimeError("LeRobotV3DatasetWriter.finalize(): no episodes were added.")
+        # Drain the encoder pool first so info.json can be written with real
+        # video dimensions. Collect-then-report failures so users see all of
+        # them in one shot rather than a noisy half-encoded mess.
+        failed: list[tuple[int, str]] = []
+        for idx in sorted(self._encode_futures.keys()):
+            try:
+                h, w = self._encode_futures[idx].result()
+            except Exception as exc:  # noqa: BLE001 — surface anything ffmpeg raised
+                failed.append((idx, f"{type(exc).__name__}: {exc}"))
+                continue
+            if self._video_size is None and h > 0 and w > 0:
+                self._video_size = (h, w)
+        self._encode_pool.shutdown(wait=False)
+        if failed:
+            details = "; ".join(f"ep={i}: {msg}" for i, msg in failed[:5])
+            more = f" (+{len(failed)-5} more)" if len(failed) > 5 else ""
+            raise RuntimeError(
+                f"video encoding failed for {len(failed)} episode(s): {details}{more}"
+            )
+
         self._write_data_shard()
         self._write_episodes_index()
         self._write_tasks_table()

@@ -38,6 +38,7 @@ _KNOWN_COMMANDS = {
     "lerobot-validate",  # legacy alias
     "doctor",
     "info",
+    "quality-report",
     "run",                # legacy ETL
     "init-config",        # legacy ETL
 }
@@ -67,6 +68,19 @@ def _add_run_all(sp: argparse._SubParsersAction) -> None:
     p.add_argument("--itw-config", type=Path)
     p.add_argument("--handpose-config", type=Path)
     p.add_argument("--lerobot-config", type=Path)
+    p.add_argument(
+        "--force", action="store_true",
+        help="Re-process sessions even if <out>/<session>/lerobot_dataset/meta/info.json "
+             "already exists (default: skip such sessions for crash-resume friendliness).",
+    )
+    p.add_argument(
+        "--no-quality-report", action="store_true",
+        help="Skip the auto quality-report run at the end (default: ON; writes quality_report.json).",
+    )
+    p.add_argument(
+        "--no-quality-psnr", action="store_true",
+        help="In the auto quality-report, skip per-episode PSNR/SSIM (faster: ~30s vs ~200s on 40 sess).",
+    )
 
 
 def _add_ingest(sp: argparse._SubParsersAction) -> None:
@@ -119,6 +133,23 @@ def _add_info(sp: argparse._SubParsersAction) -> None:
     p.add_argument("dataset_root", type=Path)
 
 
+def _add_quality_report(sp: argparse._SubParsersAction) -> None:
+    p = sp.add_parser(
+        "quality-report",
+        help="4-dim data quality report (efficiency/video/annotation/compliance) over an output root.",
+    )
+    p.add_argument("output_root", type=Path, nargs="?", default=None,
+                   help="Pipeline output root. Defaults to $MMPIPE_OUTPUT_ROOT or ./output.")
+    p.add_argument("--json", type=Path, default=None,
+                   help="Write JSON report to this path (default: <output_root>/quality_report.json).")
+    p.add_argument("--json-only", action="store_true",
+                   help="Skip human-readable summary; only write JSON.")
+    p.add_argument("--no-psnr", action="store_true",
+                   help="Skip per-episode PSNR/SSIM (much faster but loses video quality metric).")
+    p.add_argument("--parallelism", type=int, default=4,
+                   help="Per-session parallel workers (default 4).")
+
+
 def _add_legacy(sp: argparse._SubParsersAction) -> None:
     # Kept for backward compatibility; not advertised in main --help.
     p = sp.add_parser("run", help=argparse.SUPPRESS)
@@ -152,6 +183,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_handpose(sp)
     _add_annotate(sp)
     _add_lerobot(sp)
+    _add_quality_report(sp)
     _add_legacy(sp)
     return parser
 
@@ -477,10 +509,16 @@ def _cmd_run_all(args: argparse.Namespace) -> int:
         info_path = per_out / "lerobot_dataset" / "meta" / "info.json"
 
         prefix = f"[{i}/{len(sessions)}] {session.name}"
-        if info_path.exists():
-            print(f"{prefix}: SKIP (already processed, info.json found)")
+        if info_path.exists() and not args.force:
+            print(f"{prefix}: SKIP (already processed, info.json found; pass --force to re-process)")
             results.append(("skip", session.name, per_out))
             continue
+        if info_path.exists() and args.force:
+            # Force re-process: wipe the old session output so the new run is
+            # not contaminated by stale parquet / mp4 files from the prior run.
+            import shutil
+            shutil.rmtree(per_out, ignore_errors=True)
+            print(f"{prefix}: FORCE re-process (cleaned old output)")
 
         print(f"{prefix}: processing -> {per_out}")
         try:
@@ -505,6 +543,32 @@ def _cmd_run_all(args: argparse.Namespace) -> int:
         # Only one new session processed — show convenience hint
         only = next(p for r, _, p in results if r == "ok")
         print(f"\nInspect with: mmpipe info {only / 'lerobot_dataset'}")
+
+    # Auto-generate quality-report unless the user opted out. Runs over the
+    # whole output_root so it picks up both newly-processed and previously
+    # skipped sessions — gives a current snapshot of the canonical dataset.
+    if not getattr(args, "no_quality_report", False) and len(results) > 0:
+        try:
+            from .quality import (
+                print_human_summary, report_to_dict, run_quality_report,
+            )
+            print(f"\n[quality-report] generating (this may take ~30-200s)...")
+            report = run_quality_report(
+                output_root,
+                skip_psnr=bool(getattr(args, "no_quality_psnr", False)),
+                parallelism=4,
+            )
+            print_human_summary(report)
+            json_path = output_root / "quality_report.json"
+            with json_path.open("w", encoding="utf-8") as fh:
+                json.dump(report_to_dict(report), fh, ensure_ascii=False, indent=2, default=str)
+                fh.write("\n")
+            print(f"\nfull JSON: {json_path}")
+        except Exception as exc:
+            # Quality report failure should never poison the batch exit code —
+            # the dataset itself is fine; just warn and continue.
+            print(f"\n[quality-report] WARNING: failed to generate ({type(exc).__name__}: {exc})")
+
     return 0 if n_fail == 0 else 1
 
 
@@ -636,6 +700,33 @@ def _cmd_info(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_quality_report(args: argparse.Namespace) -> int:
+    from .quality import print_human_summary, report_to_dict, run_quality_report
+
+    output_root = Path(args.output_root) if args.output_root is not None else _resolve_output_root()
+    if not output_root.exists():
+        print(f"output_root does not exist: {output_root}")
+        return 2
+
+    report = run_quality_report(
+        output_root,
+        skip_psnr=bool(args.no_psnr),
+        parallelism=max(1, int(args.parallelism)),
+    )
+
+    json_path = Path(args.json) if args.json else output_root / "quality_report.json"
+    json_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = report_to_dict(report)
+    with json_path.open("w", encoding="utf-8") as fh:
+        json.dump(payload, fh, ensure_ascii=False, indent=2, default=str)
+        fh.write("\n")
+
+    if not args.json_only:
+        print_human_summary(report)
+        print(f"\nfull JSON written to: {json_path}")
+    return 0
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
@@ -651,6 +742,7 @@ _DISPATCH = {
     "lerobot-validate": _cmd_validate,
     "doctor": _cmd_doctor,
     "info": _cmd_info,
+    "quality-report": _cmd_quality_report,
     "run": _cmd_run_legacy,
     "init-config": _cmd_init_config,
 }

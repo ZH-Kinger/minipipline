@@ -26,6 +26,11 @@ class AnnotateConfig:
     # (whole-video) or fixed-stride windows.
     fixed_window_clip_len_s: float = 4.0   # used only when no atomic_actions
 
+    # Concurrency for per-clip annotation API calls (language + actions).
+    # 1 = serial (legacy behaviour). Network-bound, so 8 is a safe default
+    # for DashScope's per-key rate limits.
+    clip_parallelism: int = 8
+
     # Frame quality filtering.
     quality_blur_threshold: float = 60.0   # Laplacian variance; lower => blurry
     quality_overall_threshold: float = 0.4 # frames below this get kept=False

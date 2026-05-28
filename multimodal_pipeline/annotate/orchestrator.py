@@ -20,6 +20,7 @@ from __future__ import annotations
 import hashlib
 import json
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -27,9 +28,10 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from ..config import AnnotateConfig
-from .actions import build_action_labeler
-from .language import build_language_annotator
+from ..config import AnnotateConfig, settings
+from ..config.models import QwenVlHyper
+from .actions import DashScopeActionLabeler, build_action_labeler
+from .language import DashScopeLanguageAnnotator, build_language_annotator
 from .quality import build_quality_scorer
 from .schemas import AnnotateRunResult, ClipAnnotation, FrameQualityRow
 
@@ -195,47 +197,84 @@ def run_annotate_pipeline(
 
     video_id = _video_id_from_path(video_path)
 
-    # Language + actions per clip.
+    # Build backends and decide whether we can fuse language + actions into
+    # one Qwen-VL call. The combined path halves cost + latency when both
+    # components are dashscope; everything else uses the separate-calls path.
     language_backend = build_language_annotator(cfg)
     action_backend = build_action_labeler(cfg)
 
-    t = time.perf_counter()
-    clips: list[ClipAnnotation] = []
-    for i, (fs, fe, ts, te) in enumerate(clip_tuples):
-        text = language_backend.annotate_clip(
-            video_id=video_id,
-            clip_idx=i,
-            frame_start=fs,
-            frame_end=fe,
-            t_start_s=ts,
-            t_end_s=te,
-            task_text=task_text,
-            video_path=video_path,
-        )
-        label, score = action_backend.classify_clip(
-            video_id=video_id,
-            clip_idx=i,
-            frame_start=fs,
-            frame_end=fe,
-            t_start_s=ts,
-            t_end_s=te,
-            task_text=task_text,
-            video_path=video_path,
-        )
-        clips.append(
-            ClipAnnotation(
-                clip_idx=i,
+    combined_backend = None
+    if isinstance(language_backend, DashScopeLanguageAnnotator) and isinstance(
+        action_backend, DashScopeActionLabeler
+    ):
+        from ._combined import DashScopeCombinedAnnotator
+
+        combined_backend = DashScopeCombinedAnnotator(cfg=cfg, hyper=QwenVlHyper())
+
+    def _annotate_one(clip_idx: int, fs: int, fe: int, ts: float, te: float) -> ClipAnnotation:
+        if combined_backend is not None:
+            text, label, score = combined_backend.annotate_clip(
+                video_id=video_id,
+                clip_idx=clip_idx,
                 frame_start=fs,
                 frame_end=fe,
                 t_start_s=ts,
                 t_end_s=te,
-                language_text=text,
-                action_label=label,
-                action_score=score,
-                language_source=language_backend.name,
-                actions_source=action_backend.name,
+                task_text=task_text,
+                video_path=video_path,
             )
+            lang_src = combined_backend.name
+            act_src = combined_backend.name
+        else:
+            text = language_backend.annotate_clip(
+                video_id=video_id,
+                clip_idx=clip_idx,
+                frame_start=fs,
+                frame_end=fe,
+                t_start_s=ts,
+                t_end_s=te,
+                task_text=task_text,
+                video_path=video_path,
+            )
+            label, score = action_backend.classify_clip(
+                video_id=video_id,
+                clip_idx=clip_idx,
+                frame_start=fs,
+                frame_end=fe,
+                t_start_s=ts,
+                t_end_s=te,
+                task_text=task_text,
+                video_path=video_path,
+            )
+            lang_src = language_backend.name
+            act_src = action_backend.name
+        return ClipAnnotation(
+            clip_idx=clip_idx,
+            frame_start=fs,
+            frame_end=fe,
+            t_start_s=ts,
+            t_end_s=te,
+            language_text=text,
+            action_label=label,
+            action_score=score,
+            language_source=lang_src,
+            actions_source=act_src,
         )
+
+    t = time.perf_counter()
+    parallelism = max(1, int(getattr(cfg, "clip_parallelism", 1)))
+    if parallelism > 1 and len(clip_tuples) > 1:
+        with ThreadPoolExecutor(max_workers=parallelism) as ex:
+            futures = [
+                ex.submit(_annotate_one, i, fs, fe, ts, te)
+                for i, (fs, fe, ts, te) in enumerate(clip_tuples)
+            ]
+            clips: list[ClipAnnotation] = [f.result() for f in futures]
+    else:
+        clips = [
+            _annotate_one(i, fs, fe, ts, te)
+            for i, (fs, fe, ts, te) in enumerate(clip_tuples)
+        ]
     timings["language_actions"] = time.perf_counter() - t
 
     # Per-frame quality.

@@ -20,6 +20,18 @@ _ACTION_PROMPT = (
 )
 
 
+# Combined prompt used when both language + actions backends are dashscope:
+# one API call returns both fields in a single JSON object, halving cost and
+# latency vs. two separate calls.
+_COMBINED_PROMPT = (
+    "你是人类示范视频分析助手。给你一个片段（{n_frames} 帧，时长 "
+    "{duration_s:.1f} 秒，主任务：{task_text}）。请输出严格 JSON："
+    "{{\"description\": \"<一句话中文描述这一段里双手做了什么，不超过 30 个字>\", "
+    "\"action\": \"<从以下类别选一个：{vocab}>\"}}。"
+    "只输出 JSON 对象本身，不要 markdown 代码块或其它解释文字。"
+)
+
+
 @dataclass(frozen=True)
 class QwenVlHyper(ModelHyperMixin):
     """Hyperparameters for the Qwen-VL annotator."""
@@ -39,6 +51,10 @@ class QwenVlHyper(ModelHyperMixin):
     # Prompt templates.
     language_prompt_template: str = _LANGUAGE_PROMPT
     action_prompt_template: str = _ACTION_PROMPT
+    combined_prompt_template: str = _COMBINED_PROMPT
+
+    # Combined-call needs more tokens for the JSON envelope + description.
+    combined_max_tokens: int = 128
 
 
 __all__ = ["QwenVlHyper"]
