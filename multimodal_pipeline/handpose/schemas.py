@@ -133,6 +133,10 @@ class MergedPrediction:
     pred_kept: np.ndarray  # (2, N) bool   -- original validity before fill
     trajectory: CameraTrajectory  # full-video, clip_idx = -1
     intrinsics: CameraIntrinsics
+    # Real 21-keypoint world-space hand pose, when sourced from the
+    # real_ingest backend; (2, N, 21, 3) float32. None for the mock chain
+    # (which only fabricates MANO params, not raw keypoints).
+    hand_keypoints_world: np.ndarray | None = None
 
     @property
     def n_frames(self) -> int:

@@ -19,6 +19,7 @@ import urllib.request
 from pathlib import Path
 
 from .._system import check_ffmpeg
+from ._cache import AnnotationCache
 
 
 _DEFAULT_ENDPOINT = (
@@ -47,12 +48,24 @@ def extract_clip_frames(
     t_end_s: float,
     max_frames: int,
     long_edge_px: int,
+    *,
+    frame_indices: list[int] | None = None,
 ) -> list[bytes]:
-    """Extract up to ``max_frames`` JPEG bytes from a clip via ffmpeg.
+    """Extract JPEG bytes from a clip via ffmpeg.
 
-    Frames are sampled uniformly across ``[t_start_s, t_end_s)``. Returned
-    bytes are JPEG-encoded and ready to base64-embed in a DashScope request.
+    Two modes:
+      - ``frame_indices`` given: extract exactly those source-frame indices
+        (used by the motion-peak sampler). The list should be sorted; values
+        are interpreted as 0-based frame numbers in the source video.
+      - ``frame_indices`` None: uniformly sample ``max_frames`` over
+        ``[t_start_s, t_end_s)`` (legacy behaviour).
+
+    Returned bytes are JPEG-encoded and ready to base64-embed in a DashScope
+    request.
     """
+    if frame_indices is not None and len(frame_indices) > 0:
+        return _extract_by_index(video_path, frame_indices, long_edge_px)
+
     if t_end_s <= t_start_s:
         return []
     bundle = check_ffmpeg()
@@ -80,6 +93,40 @@ def extract_clip_frames(
     return out
 
 
+def _extract_by_index(
+    video_path: Path, frame_indices: list[int], long_edge_px: int,
+) -> list[bytes]:
+    """Extract a specific set of source frames via ffmpeg select filter.
+
+    Uses ``select='eq(n,X)+eq(n,Y)+...'`` so ffmpeg decodes the whole stream
+    once and emits only the chosen frames. Output order matches source frame
+    order (ffmpeg select preserves input order regardless of expression order).
+    """
+    bundle = check_ffmpeg()
+    select_expr = "+".join(f"eq(n\\,{i})" for i in sorted(set(int(x) for x in frame_indices)))
+    vf = (
+        f"select='{select_expr}',"
+        f"scale='if(gt(iw,ih),{long_edge_px},-2)':"
+        f"'if(gt(iw,ih),-2,{long_edge_px})'"
+    )
+    with tempfile.TemporaryDirectory(prefix="mmpipe_dashscope_") as tmpdir:
+        out_pattern = str(Path(tmpdir) / "f_%03d.jpg")
+        cmd = [
+            str(bundle.ffmpeg),
+            "-v", "error",
+            "-i", str(video_path),
+            "-vf", vf,
+            "-vsync", "vfr",
+            "-q:v", "5",
+            out_pattern,
+        ]
+        subprocess.run(cmd, check=True, capture_output=True)
+        out: list[bytes] = []
+        for p in sorted(Path(tmpdir).glob("f_*.jpg")):
+            out.append(p.read_bytes())
+    return out
+
+
 def call_qwen_vl(
     *,
     api_key: str,
@@ -91,13 +138,25 @@ def call_qwen_vl(
     max_tokens: int = 96,
     endpoint: str | None = None,
     timeout_s: float = 30.0,
+    cache: AnnotationCache | None = None,
 ) -> str:
     """Call DashScope's multimodal generation endpoint, return the text output.
 
     Encodes each frame as ``data:image/jpeg;base64,...`` and ships them as
     ``image`` content items alongside a single text turn. Returns the model's
     plain-text reply (first choice, first content item that is text).
+
+    When ``cache`` is provided, identical inputs (model + prompt + gen params
+    + frame content hashes) short-circuit the network call.
     """
+    if cache is not None:
+        cached = cache.get(
+            model=model, prompt=prompt, frame_bytes_list=frame_bytes_list,
+            temperature=temperature, top_p=top_p, max_tokens=max_tokens,
+        )
+        if cached is not None:
+            return cached
+
     endpoint = endpoint or os.environ.get("MMPIPE_DASHSCOPE_ENDPOINT", "").strip() or _DEFAULT_ENDPOINT
 
     content: list[dict] = []
@@ -150,13 +209,27 @@ def call_qwen_vl(
         raise DashScopeError(f"DashScope response had no choices: {payload}")
     message = choices[0].get("message") or {}
     msg_content = message.get("content")
+    extracted: str | None = None
     if isinstance(msg_content, str):
-        return msg_content.strip()
-    if isinstance(msg_content, list):
+        extracted = msg_content.strip()
+    elif isinstance(msg_content, list):
         for item in msg_content:
             if isinstance(item, dict) and "text" in item:
-                return str(item["text"]).strip()
-    raise DashScopeError(f"Could not extract text from DashScope response: {payload}")
+                extracted = str(item["text"]).strip()
+                break
+    if extracted is None:
+        raise DashScopeError(f"Could not extract text from DashScope response: {payload}")
+    if cache is not None:
+        try:
+            cache.put(
+                model=model, prompt=prompt, frame_bytes_list=frame_bytes_list,
+                temperature=temperature, top_p=top_p, max_tokens=max_tokens,
+                response_text=extracted,
+            )
+        except Exception:
+            # Cache write failure must not poison a successful API call.
+            pass
+    return extracted
 
 
 __all__ = [

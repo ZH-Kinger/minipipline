@@ -30,6 +30,7 @@ import pyarrow.parquet as pq
 
 from ..config import AnnotateConfig, settings
 from ..config.models import QwenVlHyper
+from ._sampling import double_hand_max_speed
 from .actions import DashScopeActionLabeler, build_action_labeler
 from .language import DashScopeLanguageAnnotator, build_language_annotator
 from .quality import build_quality_scorer
@@ -166,6 +167,7 @@ def run_annotate_pipeline(
     nir_dir: str | Path,
     cfg: AnnotateConfig | None = None,
     atomic_actions: Iterable[Any] | None = None,
+    merged_prediction: Any | None = None,
 ) -> AnnotateRunResult:
     """Run language + actions + quality backends on a NIR session.
 
@@ -173,6 +175,11 @@ def run_annotate_pipeline(
     produced by Layer 2. When provided, each atomic action becomes one clip
     for the language / actions backends. When None, the orchestrator falls
     back to fixed-stride clipping driven by ``cfg.fixed_window_clip_len_s``.
+
+    ``merged_prediction`` is the Layer 2 :class:`MergedPrediction`. When
+    provided AND ``cfg.frame_sampling == "motion_peak"``, the VLM sees
+    velocity-peak frames instead of uniform samples — substantially better
+    grounding on the action-defining moments.
     """
 
     cfg = cfg or AnnotateConfig()
@@ -211,6 +218,14 @@ def run_annotate_pipeline(
 
         combined_backend = DashScopeCombinedAnnotator(cfg=cfg, hyper=QwenVlHyper())
 
+    # Per-video wrist speed for motion-peak sampling (computed once, sliced
+    # per-clip inside _annotate_one). None when Layer 2 prediction is absent.
+    wrist_speed = (
+        double_hand_max_speed(merged_prediction.pred_trans)
+        if merged_prediction is not None and getattr(merged_prediction, "pred_trans", None) is not None
+        else None
+    )
+
     def _annotate_one(clip_idx: int, fs: int, fe: int, ts: float, te: float) -> ClipAnnotation:
         if combined_backend is not None:
             text, label, score = combined_backend.annotate_clip(
@@ -222,6 +237,7 @@ def run_annotate_pipeline(
                 t_end_s=te,
                 task_text=task_text,
                 video_path=video_path,
+                wrist_speed=wrist_speed,
             )
             lang_src = combined_backend.name
             act_src = combined_backend.name
@@ -296,11 +312,16 @@ def run_annotate_pipeline(
         _write_frame_quality_parquet(nir_dir / "frame_quality.parquet", frame_quality)
     timings["write"] = time.perf_counter() - t
 
+    cache_stats: dict[str, float] = {}
+    if combined_backend is not None and combined_backend._cache is not None:
+        cache_stats = combined_backend._cache.stats()
+
     return AnnotateRunResult(
         clips=clips,
         frame_quality=frame_quality,
         stage_timings=timings,
         nir_dir=str(nir_dir),
+        cache_stats=cache_stats,
     )
 
 

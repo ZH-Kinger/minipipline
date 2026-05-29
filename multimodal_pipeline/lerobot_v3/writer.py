@@ -31,6 +31,7 @@ from .schema import (
     STATE_DIM,
     STATE_LAYOUT,
     STATE_MASK_DIM,
+    HAND_KEYPOINTS_DIM,
     WRIST_TRANSL_DIM,
     build_data_schema,
     build_episodes_schema,
@@ -42,6 +43,71 @@ from .stats import StatsAccumulator
 
 HAND_LEFT = 0
 HAND_RIGHT = 1
+
+# Second video stream key for the 16-bit metric depth map.
+DEPTH_VIDEO_KEY = "observation.images.depth"
+
+
+# Cache nvenc-availability probe per ffmpeg binary so concurrent writers /
+# repeated episodes don't re-probe. Maps str(ffmpeg_path) → bool.
+_NVENC_OK: dict[str, bool] = {}
+
+
+def _probe_nvenc(ffmpeg: Path) -> bool:
+    """True iff this ffmpeg can actually encode with h264_nvenc right now.
+
+    A working build + present driver + free NVENC session are all required;
+    the only reliable test is a tiny real encode. Result is cached.
+    """
+    key = str(ffmpeg)
+    if key in _NVENC_OK:
+        return _NVENC_OK[key]
+    ok = False
+    try:
+        cmd = [
+            str(ffmpeg), "-hide_banner", "-loglevel", "error",
+            "-f", "lavfi", "-i", "testsrc=size=64x64:rate=1:duration=1",
+            "-c:v", "h264_nvenc", "-f", "null", "-",
+        ]
+        res = subprocess.run(cmd, capture_output=True, timeout=30)
+        ok = res.returncode == 0
+    except Exception:
+        ok = False
+    _NVENC_OK[key] = ok
+    return ok
+
+
+def _nvenc_preset(x264_preset: str) -> str:
+    """Map an x264 preset name to the closest nvenc p1..p7 preset.
+
+    nvenc presets: p1 (fastest) .. p7 (slowest/best quality). We bias toward
+    quality (p5/p6) since NVENC is so cheap on CPU there's no reason to rush.
+    """
+    mapping = {
+        "ultrafast": "p1", "superfast": "p1", "veryfast": "p2",
+        "faster": "p3", "fast": "p4", "medium": "p5",
+        "slow": "p6", "slower": "p7", "veryslow": "p7",
+    }
+    return mapping.get((x264_preset or "medium").lower(), "p5")
+
+
+def _resolve_encoder(requested: str, ffmpeg: Path) -> str:
+    """Map the requested encoder ("auto"/"nvenc"/"x264") to a concrete one.
+
+    "auto"  → "nvenc" if probe succeeds else "x264".
+    "nvenc" → "nvenc" if probe succeeds else "x264" (warn-and-fallback).
+    "x264"  → "x264".
+    """
+    req = (requested or "auto").lower()
+    if req == "x264":
+        return "x264"
+    if req in ("auto", "nvenc"):
+        if _probe_nvenc(ffmpeg):
+            return "nvenc"
+        if req == "nvenc":
+            print("  [warn] h264_nvenc requested but probe failed; using x264.")
+        return "x264"
+    return "x264"
 
 
 @dataclass
@@ -67,6 +133,13 @@ class EpisodeInput:
     # Layer 1.5 annotation (per-episode, repeated to each row).
     action_label: str = ""
     action_score: float = 0.0
+    # Real 21-keypoint world-frame hand pose (2, T, 21, 3) — None for mock.
+    hand_keypoints_world: np.ndarray | None = None
+    # Optional 16-bit metric depth source (depth_head.mkv). None = no depth.
+    depth_source_video_path: Path | None = None
+    # Optional per-frame IMU (T, 6) and audio contact phase (T,) int.
+    imu_per_frame: np.ndarray | None = None
+    contact_phase: np.ndarray | None = None
 
     @property
     def length(self) -> int:
@@ -139,6 +212,9 @@ class LeRobotV3DatasetWriter:
         self.fps = float(fps)
         self._ffmpeg = check_ffmpeg()
 
+        # Resolve which video encoder to actually use ("auto" → probe nvenc).
+        self._encoder = _resolve_encoder(self.cfg.video_encoder, self._ffmpeg.ffmpeg)
+
         self._tasks: dict[str, int] = {}        # task_text → task_index
         self._episodes: list[dict[str, Any]] = []
         self._data_rows: list[dict[str, Any]] = []
@@ -156,6 +232,9 @@ class LeRobotV3DatasetWriter:
             max_workers=workers, thread_name_prefix="mmpipe-encode"
         )
         self._encode_futures: dict[int, Future[tuple[int, int]]] = {}
+        # Depth (16-bit metric) is encoded losslessly to a parallel .mkv stream.
+        self._depth_encode_futures: dict[int, Future[None]] = {}
+        self._has_depth = False
         # Source W/H cache: source W/H == output W/H (no scale filter), so probe
         # each source video at most once across all its episodes.
         self._source_wh: dict[Path, tuple[int, int]] = {}
@@ -232,6 +311,22 @@ class LeRobotV3DatasetWriter:
             [ep.pred_kept[HAND_LEFT], ep.pred_kept[HAND_RIGHT]], axis=1
         ).astype(bool)
 
+        # 4b. Real hand keypoints: world → camera frame, flattened to (T, 126).
+        #     NaN-filled when no real keypoints (mock chain) so the column is
+        #     always present and downstream can mask on NaN.
+        hand_kp_cam = np.full((T, HAND_KEYPOINTS_DIM), np.nan, dtype=np.float32)
+        if ep.hand_keypoints_world is not None:
+            kpw = ep.hand_keypoints_world  # (2, T, 21, 3)
+            for hand in (HAND_LEFT, HAND_RIGHT):
+                pts_world = kpw[hand].astype(np.float32)        # (T, 21, 3)
+                flat_world = pts_world.reshape(T * 21, 3)
+                # Reuse the per-frame extrinsic by repeating it across the 21 pts.
+                ext_rep = np.repeat(ep.extrinsics_w2c, 21, axis=0)  # (T*21, 4, 4)
+                cam = _apply_extrinsic_to_translation(flat_world, ext_rep)  # (T*21, 3)
+                cam = cam.reshape(T, 21 * 3)
+                base = hand * (21 * 3)
+                hand_kp_cam[:, base:base + 21 * 3] = cam
+
         # 5. Per-frame rows.
         ep_global_start = self._next_global_index
         extrinsics_flat = ep.extrinsics_w2c.reshape(T, EXTRINSICS_FLAT_DIM).astype(np.float32)
@@ -261,6 +356,15 @@ class LeRobotV3DatasetWriter:
                 "right_kept": bool(ep.pred_kept[HAND_RIGHT, t]),
                 "right_seg_start": -1,
                 "right_seg_end": -1,
+                "observation.hand_keypoints": hand_kp_cam[t].tolist(),
+                "observation.imu": (
+                    ep.imu_per_frame[t].astype(np.float32).tolist()
+                    if ep.imu_per_frame is not None
+                    else [0.0] * 6
+                ),
+                "observation.contact_phase": (
+                    int(ep.contact_phase[t]) if ep.contact_phase is not None else 0
+                ),
                 "action_label": ep.action_label,
                 "action_score": float(ep.action_score),
             }
@@ -287,6 +391,18 @@ class LeRobotV3DatasetWriter:
         self._encode_futures[int(ep.episode_index)] = self._encode_pool.submit(
             self._encode_episode_video, ep, video_path
         )
+
+        # 6b. Optional depth stream — lossless FFV1 gray16le .mkv (preserves the
+        #     16-bit metric depth; H264/yuv420p would destroy it).
+        if ep.depth_source_video_path is not None:
+            self._has_depth = True
+            depth_relpath = (
+                f"videos/{DEPTH_VIDEO_KEY}/chunk-000/episode_{ep.episode_index:06d}.mkv"
+            )
+            self._video_files.append(depth_relpath)
+            self._depth_encode_futures[int(ep.episode_index)] = self._encode_pool.submit(
+                self._encode_depth_video, ep, self.root / depth_relpath
+            )
 
         # 7. Episode index row.
         ep_global_end = ep_global_start + T
@@ -362,25 +478,71 @@ class LeRobotV3DatasetWriter:
         ]
         if self.cfg.video_force_fps:
             cmd += ["-vf", f"fps={self.fps}"]
-        cmd += [
-            "-c:v", "libx264",
-            "-preset", self.cfg.video_preset,
-            "-crf", str(self.cfg.video_crf),
-        ]
-        if self.cfg.video_tune:
-            cmd += ["-tune", self.cfg.video_tune]
-        cmd += [
-            "-pix_fmt", self.cfg.video_pix_fmt,
-            "-threads", str(max(1, self.cfg.video_x264_threads)),
-            "-x264-params", "keyint=30:min-keyint=30:scenecut=0",
-            "-an",
-            str(tmp),
-        ]
+        if self._encoder == "nvenc":
+            # Hardware encode on the GPU's dedicated NVENC ASIC: near-zero CPU,
+            # low heat. -cq is the constant-quality knob (analogous to x264 crf);
+            # GOP locked to 30 with forced IDR so frame 0 is a keyframe for
+            # random-access dataloading. No -threads (hardware) / no -tune.
+            cmd += [
+                "-c:v", "h264_nvenc",
+                "-preset", _nvenc_preset(self.cfg.video_preset),
+                "-rc", "vbr",
+                "-cq", str(self.cfg.video_crf),
+                "-pix_fmt", self.cfg.video_pix_fmt,
+                "-g", "30",
+                "-keyint_min", "30",
+                "-no-scenecut", "1",
+                "-forced-idr", "1",
+                "-an",
+                str(tmp),
+            ]
+        else:
+            cmd += [
+                "-c:v", "libx264",
+                "-preset", self.cfg.video_preset,
+                "-crf", str(self.cfg.video_crf),
+            ]
+            if self.cfg.video_tune:
+                cmd += ["-tune", self.cfg.video_tune]
+            cmd += [
+                "-pix_fmt", self.cfg.video_pix_fmt,
+                "-threads", str(max(1, self.cfg.video_x264_threads)),
+                "-x264-params", "keyint=30:min-keyint=30:scenecut=0",
+                "-an",
+                str(tmp),
+            ]
         subprocess.run(cmd, check=True, capture_output=True)
         tmp.replace(dst)
         # Return cached source (H, W) — same as the just-written file because we
         # didn't apply any scale filter.
         return self._source_wh.get(ep.source_video_path, (0, 0))
+
+    def _encode_depth_video(self, ep: EpisodeInput, dst: Path) -> None:
+        """Encode the episode's depth window losslessly (FFV1 gray16le .mkv).
+
+        Depth is 16-bit metric (gray16le); we must NOT re-encode to 8-bit
+        H264/yuv420p or the depth values are destroyed. FFV1 is lossless and
+        preserves the full 16-bit range. Frame-accurate output seek by seconds
+        (depth timestamps differ slightly from RGB — sub-frame tolerance).
+        """
+        t_start = ep.frame_start / ep.source_fps
+        duration = ep.length / ep.source_fps
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        tmp = dst.with_suffix(".partial.mkv")
+        cmd = [
+            str(self._ffmpeg.ffmpeg),
+            "-y",
+            "-loglevel", "error",
+            "-i", str(ep.depth_source_video_path),
+            "-ss", f"{t_start:.6f}",
+            "-t", f"{duration:.6f}",
+            "-c:v", "ffv1",
+            "-pix_fmt", "gray16le",
+            "-an",
+            str(tmp),
+        ]
+        subprocess.run(cmd, check=True, capture_output=True)
+        tmp.replace(dst)
 
     def _write_data_shard(self) -> None:
         if not self._data_rows:
@@ -438,6 +600,8 @@ class LeRobotV3DatasetWriter:
             video_width=width,
             video_codec=self.cfg.video_codec,
             video_pix_fmt=self.cfg.video_pix_fmt,
+            include_depth=self._has_depth,
+            depth_video_key=DEPTH_VIDEO_KEY,
         )
         with (self.root / "meta" / "info.json").open("w", encoding="utf-8") as fh:
             json.dump(info, fh, ensure_ascii=False, indent=2, sort_keys=True)
@@ -467,6 +631,12 @@ class LeRobotV3DatasetWriter:
                 continue
             if self._video_size is None and h > 0 and w > 0:
                 self._video_size = (h, w)
+        # Drain depth encodes (lossless mkv) — surface failures the same way.
+        for idx in sorted(self._depth_encode_futures.keys()):
+            try:
+                self._depth_encode_futures[idx].result()
+            except Exception as exc:  # noqa: BLE001
+                failed.append((idx, f"depth: {type(exc).__name__}: {exc}"))
         self._encode_pool.shutdown(wait=False)
         if failed:
             details = "; ".join(f"ep={i}: {msg}" for i, msg in failed[:5])

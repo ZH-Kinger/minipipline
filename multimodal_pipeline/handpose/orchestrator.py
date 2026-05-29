@@ -125,6 +125,40 @@ def run_handpose_pipeline(
     clips = plan_clips(video, label_segments, cfg)
     timings["clip_split"] = time.perf_counter() - t
 
+    # Real-ingest fast path: when the handpose backend is "real_ingest", skip
+    # the entire 5-stage mock/GPU chain and assemble MergedPrediction directly
+    # from the NIR ground truth (real keypoints + head 6DOF + intrinsics).
+    from ..config import settings as _settings
+
+    try:
+        _hp_backend = _settings.backend("hawor_s2", fallback_key="HANDPOSE_BACKEND")
+    except Exception:
+        _hp_backend = "mock"
+    if _hp_backend == "real_ingest":
+        from .real_ingest import build_merged_from_nir
+
+        t = time.perf_counter()
+        merged = build_merged_from_nir(nir_dir, video)
+        timings["real_ingest"] = time.perf_counter() - t
+
+        t = time.perf_counter()
+        atomic = []
+        for idx, label in enumerate(label_segments):
+            atomic.extend(
+                atomic_split_for_label(label, merged.pred_trans, merged.pred_valid, cfg, idx)
+            )
+        timings["action_seg"] = time.perf_counter() - t
+
+        return HandPoseRunResult(
+            video=video,
+            intrinsics=merged.intrinsics,
+            merged=merged,
+            clip_plans=clips,
+            label_segments=label_segments,
+            atomic_actions=atomic,
+            stage_timings=timings,
+        )
+
     geo = build_geocalib_backend(cfg)
     moge = build_moge2_backend(cfg)
     s1 = build_hawor_s1_backend(cfg)

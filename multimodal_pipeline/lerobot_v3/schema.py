@@ -24,6 +24,9 @@ ORIENT_ROTMAT_DIM = 9  # 3×3 row-major
 WRIST_TRANSL_DIM = 3
 FOV_DIM = 2
 STATE_MASK_DIM = 2
+HAND_KP_COUNT = 21                              # MANO-style keypoints per hand
+HAND_KEYPOINTS_DIM = 2 * HAND_KP_COUNT * 3      # 126 = 2 hands × 21 × 3 (camera frame)
+IMU_DIM = 6                                     # acc xyz + gyro xyz, per frame
 
 
 # State vector layout: [left 61 | right 61]. Each slice is (start, end_exclusive).
@@ -96,6 +99,12 @@ def build_data_schema() -> pa.Schema:
         pa.field("right_kept", pa.bool_()),
         pa.field("right_seg_start", pa.int64()),
         pa.field("right_seg_end", pa.int64()),
+        # Real 21-keypoint hand pose (camera frame), 2×21×3 flattened. All-NaN
+        # when sourced from the mock chain (which has no real keypoints).
+        pa.field("observation.hand_keypoints", _vec(HAND_KEYPOINTS_DIM)),
+        # Per-frame IMU (acc xyz + gyro xyz) and audio-derived contact phase.
+        pa.field("observation.imu", _vec(IMU_DIM)),
+        pa.field("observation.contact_phase", pa.int8()),
         # Layer 1.5 annotation fields (constant across an episode's frames).
         pa.field("action_label", pa.string()),
         pa.field("action_score", pa.float32()),
@@ -153,8 +162,10 @@ def build_info_dict(
     video_width: int,
     video_codec: str,
     video_pix_fmt: str,
+    include_depth: bool = False,
+    depth_video_key: str = "observation.images.depth",
 ) -> dict[str, Any]:
-    return {
+    result = {
         "codebase_version": codebase_version,
         "robot_type": robot_type,
         "total_episodes": total_episodes,
@@ -192,6 +203,9 @@ def build_info_dict(
             "timestamp": {"dtype": "float32", "shape": [1]},
             "action_label": {"dtype": "string", "shape": [1]},
             "action_score": {"dtype": "float32", "shape": [1]},
+            "observation.hand_keypoints": {"dtype": "float32", "shape": [HAND_KEYPOINTS_DIM]},
+            "observation.imu": {"dtype": "float32", "shape": [IMU_DIM]},
+            "observation.contact_phase": {"dtype": "int8", "shape": [1]},
             video_key: {
                 "dtype": "video",
                 "shape": [video_height, video_width, 3],
@@ -205,3 +219,21 @@ def build_info_dict(
             },
         },
     }
+    if include_depth:
+        # 16-bit single-channel metric depth, stored losslessly (FFV1 gray16le
+        # .mkv). Non-standard vs LeRobot's 8-bit RGB assumption — flagged here so
+        # consumers decode it as 16-bit single channel, not 3-channel RGB.
+        result["features"][depth_video_key] = {
+            "dtype": "video",
+            "shape": [video_height, video_width, 1],
+            "info": {
+                "video.fps": fps,
+                "video.height": video_height,
+                "video.width": video_width,
+                "video.codec": "ffv1",
+                "video.pix_fmt": "gray16le",
+                "video.is_depth": True,
+                "video.container": "mkv",
+            },
+        }
+    return result

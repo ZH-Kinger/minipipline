@@ -10,6 +10,12 @@ build/
 # CLI default output root and explicit user-facing outputs.
 output/
 
+# Transient test outputs and local report/log snapshots.
+output_test_*/
+_smoke_*/
+quality_*.json
+*.log
+
 # IDE / tooling state.
 .idea/
 .claude/

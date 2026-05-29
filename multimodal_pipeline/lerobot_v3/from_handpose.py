@@ -30,6 +30,9 @@ def build_episode_inputs(
     atomic_actions: list[AtomicAction],
     source_video_path: Path,
     clip_annotations: list[ClipAnnotation] | None = None,
+    depth_video_path: Path | None = None,
+    imu_per_frame: np.ndarray | None = None,
+    contact_phase: np.ndarray | None = None,
 ) -> list[EpisodeInput]:
     """Slice a `MergedPrediction` into per-`AtomicAction` `EpisodeInput`s ready for the writer.
 
@@ -77,6 +80,14 @@ def build_episode_inputs(
                 intrinsics_fov=fov,
                 action_label=action_label,
                 action_score=action_score,
+                hand_keypoints_world=(
+                    merged.hand_keypoints_world[:, a:b]
+                    if merged.hand_keypoints_world is not None
+                    else None
+                ),
+                depth_source_video_path=depth_video_path,
+                imu_per_frame=(imu_per_frame[a:b] if imu_per_frame is not None else None),
+                contact_phase=(contact_phase[a:b] if contact_phase is not None else None),
             )
         )
     return episodes

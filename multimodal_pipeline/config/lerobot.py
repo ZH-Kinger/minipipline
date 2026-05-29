@@ -27,9 +27,15 @@ class LeRobotConfig:
     # Video encoding (per-episode .mp4).
     video_codec: str = "h264"
     video_pix_fmt: str = "yuv420p"
-    video_crf: int = 20                # 23→20: PSNR-Y +~1.5dB, files ~+35%
-    video_preset: str = "medium"
-    video_tune: str = "film"           # "" disables; "film" suits live-action ego video
+    # Encoder selection: "x264" = CPU software encode (portable, high CPU);
+    # "nvenc" = NVIDIA hardware encode (offloads to GPU's dedicated NVENC ASIC,
+    # ~near-zero CPU, low heat); "auto" = use nvenc if a probe succeeds, else
+    # fall back to x264. Auto is the safe default on laptops that overheat
+    # under parallel x264.
+    video_encoder: str = "auto"
+    video_crf: int = 20                # x264: 23→20 PSNR-Y +~1.5dB. nvenc maps to -cq.
+    video_preset: str = "medium"       # x264 preset; nvenc uses p1..p7 (see writer).
+    video_tune: str = "film"           # x264 only; "" disables. Ignored by nvenc.
     video_force_fps: bool = False      # True restores legacy `-vf fps=<fps>` resample
     video_workers: int = 3             # parallel ffmpeg subprocesses; 0 = auto (cpu//4)
     video_x264_threads: int = 2        # per-ffmpeg x264 thread cap; balances vs video_workers

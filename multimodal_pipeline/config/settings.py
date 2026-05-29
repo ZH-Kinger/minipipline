@@ -27,7 +27,7 @@ _ENV_PREFIX = "MMPIPE_"
 # Valid backend identifiers. Open-ended: each model dispatch site is
 # responsible for raising a helpful NotImplementedError for backends it
 # doesn't yet wire.
-_KNOWN_BACKENDS = ("mock", "real", "rule_based", "dashscope", "local")
+_KNOWN_BACKENDS = ("mock", "real", "real_ingest", "rule_based", "dashscope", "local")
 _KNOWN_MODELS = ("geocalib", "moge2", "hawor_s1", "megasam", "hawor_s2")
 
 

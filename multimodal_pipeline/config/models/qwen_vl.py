@@ -23,7 +23,24 @@ _ACTION_PROMPT = (
 # Combined prompt used when both language + actions backends are dashscope:
 # one API call returns both fields in a single JSON object, halving cost and
 # latency vs. two separate calls.
+#
+# CoT variant: ask the model to reason about objects + hand state + best
+# matching action category before emitting the final JSON. Forces stricter
+# grounding and dramatically reduces parse failures vs. the original prompt.
 _COMBINED_PROMPT = (
+    "你是人类示范视频分析助手。给你一个片段（{n_frames} 帧，时长 "
+    "{duration_s:.1f} 秒，主任务：{task_text}）。\n\n"
+    "**只输出严格 JSON 对象**（不要 markdown 围栏 ``` 或多余文字），结构如下：\n"
+    "{{\n"
+    "  \"reasoning\": \"先简短逐步分析：(1) 画面里有什么物体；(2) 双手处于什么状态、"
+    "正在做什么动作；(3) 该动作最匹配下列哪一类。\",\n"
+    "  \"description\": \"<一句话中文描述双手做了什么，不超过 30 个字、第三人称、现在进行时>\",\n"
+    "  \"action\": \"<从以下类别精确选一个：{vocab}>\"\n"
+    "}}"
+)
+
+# Legacy non-CoT prompt kept for A/B rollback. Mirrors the pre-CoT behaviour.
+_COMBINED_PROMPT_LEGACY = (
     "你是人类示范视频分析助手。给你一个片段（{n_frames} 帧，时长 "
     "{duration_s:.1f} 秒，主任务：{task_text}）。请输出严格 JSON："
     "{{\"description\": \"<一句话中文描述这一段里双手做了什么，不超过 30 个字>\", "
@@ -53,8 +70,9 @@ class QwenVlHyper(ModelHyperMixin):
     action_prompt_template: str = _ACTION_PROMPT
     combined_prompt_template: str = _COMBINED_PROMPT
 
-    # Combined-call needs more tokens for the JSON envelope + description.
-    combined_max_tokens: int = 128
+    # Combined-call needs more tokens for the CoT reasoning + JSON envelope
+    # + description. ~250 tokens fits the schema with room to spare.
+    combined_max_tokens: int = 256
 
 
 __all__ = ["QwenVlHyper"]

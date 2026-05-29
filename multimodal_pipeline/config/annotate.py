@@ -31,6 +31,17 @@ class AnnotateConfig:
     # for DashScope's per-key rate limits.
     clip_parallelism: int = 8
 
+    # Persistent SQLite cache for DashScope responses. None = disabled. CLI
+    # `_cmd_run_all` defaults this to <output_root>/.annotation_cache.db
+    # unless --no-cache is passed.
+    cache_db: Path | None = None
+
+    # Frame sampling for the VLM. "uniform" = legacy ffmpeg fps sampling;
+    # "motion_peak" = pick top-velocity frames from Layer 2 wrist trajectory
+    # (falls back to uniform when Layer 2 signal is unavailable or the clip
+    # is below threshold).
+    frame_sampling: str = "motion_peak"
+
     # Frame quality filtering.
     quality_blur_threshold: float = 60.0   # Laplacian variance; lower => blurry
     quality_overall_threshold: float = 0.4 # frames below this get kept=False
@@ -56,6 +67,9 @@ class AnnotateConfig:
         unknown = sorted(set(raw) - allowed)
         if unknown:
             raise ValueError(f"Unknown Annotate config key(s): {', '.join(unknown)}")
+        # Coerce serialized Path-typed fields.
+        if "cache_db" in raw and raw["cache_db"] is not None:
+            raw = {**raw, "cache_db": Path(raw["cache_db"])}
         return cls(**raw)
 
 

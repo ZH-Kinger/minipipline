@@ -45,13 +45,17 @@ class AnnotatedData:
 
 
 # Canonical order of MANO-style 21 hand keypoints from the producer.
+# Names match the actual `keypoints_3d_cam_m` keys emitted by the depth-fusion
+# hand tracker: thumb_cmc/mcp/ip, {index,middle,ring,pinky}_mcp/pip/dip, *_tip.
+# (The earlier thumb_1/index_1/little_* naming never matched any real key, so
+# _extract_keypoints rejected every hand and all coords were written as nan.)
 _KP_ORDER = (
     "wrist",
-    "thumb_1", "thumb_2", "thumb_3", "thumb_tip",
-    "index_1", "index_2", "index_3", "index_tip",
-    "middle_1", "middle_2", "middle_3", "middle_tip",
-    "ring_1", "ring_2", "ring_3", "ring_tip",
-    "little_1", "little_2", "little_3", "little_tip",
+    "thumb_cmc", "thumb_mcp", "thumb_ip", "thumb_tip",
+    "index_mcp", "index_pip", "index_dip", "index_tip",
+    "middle_mcp", "middle_pip", "middle_dip", "middle_tip",
+    "ring_mcp", "ring_pip", "ring_dip", "ring_tip",
+    "pinky_mcp", "pinky_pip", "pinky_dip", "pinky_tip",
 )
 
 

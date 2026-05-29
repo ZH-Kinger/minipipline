@@ -38,6 +38,7 @@ _KNOWN_COMMANDS = {
     "lerobot-validate",  # legacy alias
     "doctor",
     "info",
+    "visualize",
     "quality-report",
     "run",                # legacy ETL
     "init-config",        # legacy ETL
@@ -80,6 +81,17 @@ def _add_run_all(sp: argparse._SubParsersAction) -> None:
     p.add_argument(
         "--no-quality-psnr", action="store_true",
         help="In the auto quality-report, skip per-episode PSNR/SSIM (faster: ~30s vs ~200s on 40 sess).",
+    )
+    p.add_argument(
+        "--no-cache", action="store_true",
+        help="Disable persistent SQLite cache for DashScope responses "
+             "(default: enabled at <output_root>/.annotation_cache.db).",
+    )
+    p.add_argument(
+        "--parallel-sessions", type=int, default=1, metavar="N",
+        help="Run N sessions concurrently via ProcessPool (default 1 = serial). "
+             "N=4 is a good batch default; goes through DashScope ~3-4x faster. "
+             "On Windows the first batch waits ~10s for process spawn.",
     )
 
 
@@ -133,6 +145,20 @@ def _add_info(sp: argparse._SubParsersAction) -> None:
     p.add_argument("dataset_root", type=Path)
 
 
+def _add_visualize(sp: argparse._SubParsersAction) -> None:
+    p = sp.add_parser(
+        "visualize",
+        help="Render keypoint-overlay (and optional depth) MP4s for human check.",
+    )
+    p.add_argument("dataset_root", type=Path, help="A packed lerobot_dataset directory.")
+    p.add_argument("--episode", type=int, action="append", default=None,
+                   help="Episode index to render (repeatable). Default: first 3.")
+    p.add_argument("--depth", action="store_true",
+                   help="Also render the depth stream as a side-by-side colormap.")
+    p.add_argument("--out", type=Path, default=None,
+                   help="Output dir (default: <dataset_root>/viz).")
+
+
 def _add_quality_report(sp: argparse._SubParsersAction) -> None:
     p = sp.add_parser(
         "quality-report",
@@ -183,6 +209,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_handpose(sp)
     _add_annotate(sp)
     _add_lerobot(sp)
+    _add_visualize(sp)
     _add_quality_report(sp)
     _add_legacy(sp)
     return parser
@@ -439,18 +466,47 @@ def _run_one_session(
     )
 
     print(f"  [Layer 1.5] annotate [{an_backends}] ...")
-    la = run_annotate_pipeline(l1.session.root, annotate_cfg, atomic_actions=l2.atomic_actions)
+    la = run_annotate_pipeline(
+        l1.session.root, annotate_cfg,
+        atomic_actions=l2.atomic_actions,
+        merged_prediction=l2.merged,
+    )
     kept = sum(1 for r in la.frame_quality if r.kept)
+    cache_note = ""
+    if la.cache_stats:
+        cs = la.cache_stats
+        cache_note = (
+            f", cache hits={int(cs['hits'])}/{int(cs['hits']) + int(cs['misses'])} "
+            f"({cs['hit_rate'] * 100:.0f}%)"
+        )
     print(
         f"    -> {len(la.clips)} clip annotations, "
-        f"{kept}/{len(la.frame_quality)} frames kept by quality filter"
+        f"{kept}/{len(la.frame_quality)} frames kept by quality filter{cache_note}"
     )
 
     print("  [Layer 3] lerobot v3 pack ...")
     media_paths = json.loads((l1.session.root / "media_paths.json").read_text(encoding="utf-8"))
     source_video = Path(media_paths["media"]["rgb"])
+    depth_src = media_paths.get("media", {}).get("depth")
+    depth_video = Path(depth_src) if depth_src else None
+
+    # Per-frame auxiliary modalities (IMU + audio contact phase) aligned to the
+    # RGB timeline, computed once per video and sliced per-episode downstream.
+    import pyarrow.parquet as _pq
+    from .itw.multimodal_features import contact_phase_per_frame, imu_per_frame
+    _fi = _pq.read_table(l1.session.root / "frame_index.parquet")
+    _frame_ts = None
+    if "rgb_timestamp_ns" in _fi.column_names:
+        _frame_ts = _fi.column("rgb_timestamp_ns").to_numpy().astype("float64") / 1e9
+    elif "rgb_timestamp_s" in _fi.column_names:
+        _frame_ts = _fi.column("rgb_timestamp_s").to_numpy().astype("float64")
+    imu_arr = imu_per_frame(l1.session.root, _frame_ts) if _frame_ts is not None else None
+    phase_arr = contact_phase_per_frame(l1.session.root, _frame_ts) if _frame_ts is not None else None
+
     episodes = build_episode_inputs(
-        l2.video, l2.merged, l2.atomic_actions, source_video, clip_annotations=la.clips
+        l2.video, l2.merged, l2.atomic_actions, source_video,
+        clip_annotations=la.clips, depth_video_path=depth_video,
+        imu_per_frame=imu_arr, contact_phase=phase_arr,
     )
     layer3_root.mkdir(parents=True, exist_ok=True)
     with LeRobotV3DatasetWriter(layer3_root, lr_cfg, fps=l2.video.fps) as w:
@@ -471,7 +527,40 @@ def _run_one_session(
     return v.ok
 
 
+def _run_one_session_worker(
+    session_path: Path,
+    per_out: Path,
+    itw_cfg,
+    hp_cfg,
+    lr_cfg,
+    annotate_cfg,
+    worker_id: int,
+    total: int,
+    idx: int,
+) -> tuple[str, str, Path]:
+    """Top-level entry point for ProcessPool workers.
+
+    Must be importable + picklable (no closures). Each worker re-enters this
+    function with its own process — annotation cache opens a fresh per-process
+    SQLite connection (WAL mode handles concurrent writes).
+    """
+    name = session_path.name
+    prefix = f"[w{worker_id}|{idx}/{total}] {name}"
+    print(f"{prefix}: processing -> {per_out}")
+    try:
+        ok = _run_one_session(
+            session_path, per_out, itw_cfg, hp_cfg, lr_cfg,
+            annotate_cfg=annotate_cfg,
+        )
+        return ("ok" if ok else "fail", name, per_out)
+    except Exception as exc:
+        print(f"{prefix}: ERROR: {type(exc).__name__}: {exc}")
+        return ("fail", name, per_out)
+
+
 def _cmd_run_all(args: argparse.Namespace) -> int:
+    from dataclasses import replace
+    from .annotate import AnnotateConfig
     from .config import HandPoseConfig, ITWConfig, LeRobotConfig
     from .itw import is_session_dir
 
@@ -480,6 +569,13 @@ def _cmd_run_all(args: argparse.Namespace) -> int:
     lr_cfg = LeRobotConfig.from_file(args.lerobot_config)
 
     output_root = Path(args.output_root) if args.output_root is not None else _resolve_output_root()
+
+    # Persistent annotation cache: enabled by default at
+    # <output_root>/.annotation_cache.db; --no-cache disables.
+    annotate_cfg = AnnotateConfig()
+    if not getattr(args, "no_cache", False):
+        cache_db_path = output_root / ".annotation_cache.db"
+        annotate_cfg = replace(annotate_cfg, cache_db=cache_db_path)
 
     # Single-session vs batch detection.
     if is_session_dir(args.session_dir, itw_cfg):
@@ -503,7 +599,10 @@ def _cmd_run_all(args: argparse.Namespace) -> int:
     explicit = " (explicit)" if args.output_root is not None else f" (from {src})"
     print(f"[{mode}] {len(sessions)} session(s) -> {output_root}/{explicit}")
 
+    # Pre-flight: classify into skip-able vs needs-processing. Skip / cleanup
+    # always runs in main process so ProcessPool workers only see fresh state.
     results: list[tuple[str, str, Path]] = []  # (status, name, per_out)
+    to_process: list[tuple[int, Path, Path]] = []  # (idx, session, per_out)
     for i, session in enumerate(sessions, 1):
         per_out = output_root / session.name
         info_path = per_out / "lerobot_dataset" / "meta" / "info.json"
@@ -514,19 +613,46 @@ def _cmd_run_all(args: argparse.Namespace) -> int:
             results.append(("skip", session.name, per_out))
             continue
         if info_path.exists() and args.force:
-            # Force re-process: wipe the old session output so the new run is
-            # not contaminated by stale parquet / mp4 files from the prior run.
             import shutil
             shutil.rmtree(per_out, ignore_errors=True)
             print(f"{prefix}: FORCE re-process (cleaned old output)")
+        to_process.append((i, session, per_out))
 
-        print(f"{prefix}: processing -> {per_out}")
-        try:
-            ok = _run_one_session(session, per_out, itw_cfg, hp_cfg, lr_cfg)
-            results.append(("ok" if ok else "fail", session.name, per_out))
-        except Exception as exc:
-            print(f"  ERROR: {type(exc).__name__}: {exc}")
-            results.append(("fail", session.name, per_out))
+    parallel_n = max(1, int(getattr(args, "parallel_sessions", 1)))
+    if parallel_n > 1 and len(to_process) > 1:
+        import platform
+        from concurrent.futures import ProcessPoolExecutor, as_completed
+        if platform.system() == "Windows":
+            print(
+                f"[parallel] launching {parallel_n} worker processes "
+                f"(Windows spawn: ~10s warmup)..."
+            )
+        else:
+            print(f"[parallel] launching {parallel_n} worker processes...")
+        with ProcessPoolExecutor(max_workers=parallel_n) as ex:
+            futures = []
+            for k, (i, session, per_out) in enumerate(to_process):
+                worker_id = (k % parallel_n) + 1
+                futures.append(ex.submit(
+                    _run_one_session_worker,
+                    session, per_out, itw_cfg, hp_cfg, lr_cfg, annotate_cfg,
+                    worker_id, len(sessions), i,
+                ))
+            for fut in as_completed(futures):
+                results.append(fut.result())
+    else:
+        for i, session, per_out in to_process:
+            prefix = f"[{i}/{len(sessions)}] {session.name}"
+            print(f"{prefix}: processing -> {per_out}")
+            try:
+                ok = _run_one_session(
+                    session, per_out, itw_cfg, hp_cfg, lr_cfg,
+                    annotate_cfg=annotate_cfg,
+                )
+                results.append(("ok" if ok else "fail", session.name, per_out))
+            except Exception as exc:
+                print(f"  ERROR: {type(exc).__name__}: {exc}")
+                results.append(("fail", session.name, per_out))
 
     n_ok = sum(1 for r, _, _ in results if r == "ok")
     n_skip = sum(1 for r, _, _ in results if r == "skip")
@@ -689,7 +815,11 @@ def _cmd_info(args: argparse.Namespace) -> int:
     def _du(paths: list[Path]) -> int:
         return sum(p.stat().st_size for p in paths if p.is_file())
 
-    vids = list((root / "videos").rglob("*.mp4")) if (root / "videos").exists() else []
+    vids = (
+        list((root / "videos").rglob("*.mp4")) + list((root / "videos").rglob("*.mkv"))
+        if (root / "videos").exists()
+        else []
+    )
     shards = list((root / "data").rglob("*.parquet")) if (root / "data").exists() else []
     meta_files = list((root / "meta").rglob("*")) if (root / "meta").exists() else []
 
@@ -697,6 +827,22 @@ def _cmd_info(args: argparse.Namespace) -> int:
     print(f"    videos    {len(vids):>4d} files  {_du(vids)/1024/1024:>7.2f} MB")
     print(f"    data      {len(shards):>4d} files  {_du(shards)/1024/1024:>7.2f} MB")
     print(f"    meta                {_du(meta_files)/1024:>7.1f} KB")
+    return 0
+
+
+def _cmd_visualize(args: argparse.Namespace) -> int:
+    from .visualize import visualize_dataset
+
+    root = Path(args.dataset_root)
+    if not (root / "meta" / "info.json").exists():
+        print(f"Not a LeRobot v3 dataset (missing {root / 'meta' / 'info.json'}).")
+        return 1
+    written = visualize_dataset(
+        root, episodes=args.episode, with_depth=bool(args.depth), out_dir=args.out,
+    )
+    print(f"Rendered {len(written)} overlay video(s):")
+    for p in written:
+        print(f"  {p}")
     return 0
 
 
@@ -742,6 +888,7 @@ _DISPATCH = {
     "lerobot-validate": _cmd_validate,
     "doctor": _cmd_doctor,
     "info": _cmd_info,
+    "visualize": _cmd_visualize,
     "quality-report": _cmd_quality_report,
     "run": _cmd_run_legacy,
     "init-config": _cmd_init_config,

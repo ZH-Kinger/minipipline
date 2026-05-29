@@ -43,6 +43,7 @@ class AnnotateRunResult:
     frame_quality: list[FrameQualityRow]
     stage_timings: dict[str, float] = field(default_factory=dict)
     nir_dir: str = ""
+    cache_stats: dict[str, float] = field(default_factory=dict)  # {} when no cache
 
 
 __all__ = ["ClipAnnotation", "FrameQualityRow", "AnnotateRunResult"]
