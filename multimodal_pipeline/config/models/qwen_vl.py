@@ -8,15 +8,17 @@ from ._base import ModelHyperMixin
 
 
 _LANGUAGE_PROMPT = (
-    "你是一个视频内容描述专家。给你一个人类示范任务的视频片段（{n_frames} 帧，"
-    "时长 {duration_s:.1f} 秒，主任务：{task_text}），用一句话精炼描述这一段"
-    "片段里发生了什么动作（重点写双手做什么）。不要超过 30 个字。"
+    "You are a video captioning expert for human-demonstration clips. You are "
+    "given a clip ({n_frames} frames, {duration_s:.1f}s, overall task: {task_text}). "
+    "Write ONE concise English sentence describing what happens in this clip "
+    "(focus on what the hands do), present tense, at most 12 words. "
+    "Always answer in English, regardless of the task text language."
 )
 
 
 _ACTION_PROMPT = (
-    "从下列原子动作类别里选出最符合该视频片段的一个："
-    "{vocab}。只输出类别名，不要其它内容。"
+    "Pick the single atomic-action category that best matches this clip from: "
+    "{vocab}. Output only the category name, nothing else."
 )
 
 
@@ -28,24 +30,29 @@ _ACTION_PROMPT = (
 # matching action category before emitting the final JSON. Forces stricter
 # grounding and dramatically reduces parse failures vs. the original prompt.
 _COMBINED_PROMPT = (
-    "你是人类示范视频分析助手。给你一个片段（{n_frames} 帧，时长 "
-    "{duration_s:.1f} 秒，主任务：{task_text}）。\n\n"
-    "**只输出严格 JSON 对象**（不要 markdown 围栏 ``` 或多余文字），结构如下：\n"
+    "You are a video analysis assistant for human-demonstration clips. You are "
+    "given a clip ({n_frames} frames, {duration_s:.1f}s, overall task: {task_text}).\n\n"
+    "**Output a STRICT JSON object only** (no markdown fences ``` and no extra "
+    "text), with this structure:\n"
     "{{\n"
-    "  \"reasoning\": \"先简短逐步分析：(1) 画面里有什么物体；(2) 双手处于什么状态、"
-    "正在做什么动作；(3) 该动作最匹配下列哪一类。\",\n"
-    "  \"description\": \"<一句话中文描述双手做了什么，不超过 30 个字、第三人称、现在进行时>\",\n"
-    "  \"action\": \"<从以下类别精确选一个：{vocab}>\"\n"
-    "}}"
+    "  \"reasoning\": \"Reason briefly step by step: (1) what objects are visible; "
+    "(2) what state the hands are in and what they are doing; (3) which category "
+    "below the action best matches.\",\n"
+    "  \"description\": \"<one English sentence describing what the hands do, "
+    "present tense, third person, at most 12 words>\",\n"
+    "  \"action\": \"<pick exactly one from: {vocab}>\"\n"
+    "}}\n"
+    "Always write the description in English, regardless of the task text language."
 )
 
 # Legacy non-CoT prompt kept for A/B rollback. Mirrors the pre-CoT behaviour.
 _COMBINED_PROMPT_LEGACY = (
-    "你是人类示范视频分析助手。给你一个片段（{n_frames} 帧，时长 "
-    "{duration_s:.1f} 秒，主任务：{task_text}）。请输出严格 JSON："
-    "{{\"description\": \"<一句话中文描述这一段里双手做了什么，不超过 30 个字>\", "
-    "\"action\": \"<从以下类别选一个：{vocab}>\"}}。"
-    "只输出 JSON 对象本身，不要 markdown 代码块或其它解释文字。"
+    "You are a video analysis assistant for human-demonstration clips. You are "
+    "given a clip ({n_frames} frames, {duration_s:.1f}s, overall task: {task_text}). "
+    "Output strict JSON: "
+    "{{\"description\": \"<one English sentence describing what the hands do, at most 12 words>\", "
+    "\"action\": \"<pick one from: {vocab}>\"}}. "
+    "Output only the JSON object itself, no markdown fences or other text."
 )
 
 
@@ -63,7 +70,17 @@ class QwenVlHyper(ModelHyperMixin):
 
     # Video downsampling before sending (controls cost + latency).
     max_clip_frames: int = 16              # send at most this many frames per clip
-    max_frame_resize_long_edge: int = 640  # downscale to this long edge
+    max_frame_resize_long_edge: int = 512  # downscale to this long edge (640->512: ~36% fewer image tokens, small-object recall mostly preserved)
+
+    # Adaptive frame count: short / low-duration clips carry fewer distinct
+    # frames, so sending the full `max_clip_frames` is redundant. Scale the
+    # frame count by clip duration (frames ≈ duration_s × adaptive_sample_fps),
+    # clamped to [min_clip_frames, max_clip_frames]. Quality-neutral: only trims
+    # frames a short clip never had distinct information for. Set False to always
+    # send max_clip_frames.
+    adaptive_frames: bool = True
+    min_clip_frames: int = 4
+    adaptive_sample_fps: float = 4.0
 
     # Prompt templates.
     language_prompt_template: str = _LANGUAGE_PROMPT

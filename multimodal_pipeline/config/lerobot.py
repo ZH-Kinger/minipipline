@@ -40,9 +40,11 @@ class LeRobotConfig:
     video_workers: int = 3             # parallel ffmpeg subprocesses; 0 = auto (cpu//4)
     video_x264_threads: int = 2        # per-ffmpeg x264 thread cap; balances vs video_workers
 
-    # Stats: keep occupied-but-placeholder values per spec; real Welford runs
-    # only when enabled.
-    enable_real_stats: bool = False
+    # Stats: real Welford statistics for observation.state (stored) + action
+    # (derived via lerobot_v3.actions). On by default so meta/stats.json carries
+    # real normalisation stats for training. Set False only to get the cheap
+    # placeholder (mean=0/std=1) when stats don't matter.
+    enable_real_stats: bool = True
 
     # Misc.
     strict_dim_validation: bool = True

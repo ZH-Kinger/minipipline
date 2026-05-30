@@ -31,6 +31,18 @@ class HandPerFrame:
     right_wrist_xyz: tuple[float, float, float] | None
     left_keypoints_3d: list[tuple[float, float, float]] | None
     right_keypoints_3d: list[tuple[float, float, float]] | None
+    # Real MANO parameters from the source tracker (camera frame). None when
+    # the hand entry has no `mano_parameters` block.
+    #   pose_aa: 45 floats = 15 joints × 3 (axis-angle, converted from the
+    #            source 15×3×3 rotation matrices)
+    #   betas:   10 floats (hand shape)
+    #   global_orient: 3 floats (wrist axis-angle, camera frame)
+    left_mano_pose_aa: list[float] | None = None
+    right_mano_pose_aa: list[float] | None = None
+    left_mano_betas: list[float] | None = None
+    right_mano_betas: list[float] | None = None
+    left_global_orient: list[float] | None = None
+    right_global_orient: list[float] | None = None
 
 
 @dataclass(frozen=True)
@@ -70,6 +82,57 @@ def _extract_keypoints(hand_entry: dict) -> list[tuple[float, float, float]] | N
             return None  # missing a canonical joint → reject this hand
         out.append((float(coord[0]), float(coord[1]), float(coord[2])))
     return out
+
+
+def _rotmat_to_aa(R: np.ndarray) -> np.ndarray:
+    """3×3 rotation matrix → (3,) axis-angle (Rodrigues log map)."""
+    cos_theta = float(np.clip((np.trace(R) - 1.0) * 0.5, -1.0, 1.0))
+    theta = np.arccos(cos_theta)
+    if theta < 1e-6:
+        return np.zeros(3, dtype=np.float64)
+    if abs(np.pi - theta) < 1e-3:
+        A = (R + np.eye(3)) * 0.5
+        k = int(np.argmax(np.diag(A)))
+        axis = A[:, k] / np.sqrt(max(A[k, k], 1e-12))
+        axis = axis / (np.linalg.norm(axis) + 1e-12)
+        return (axis * theta).astype(np.float64)
+    rx, ry, rz = R[2, 1] - R[1, 2], R[0, 2] - R[2, 0], R[1, 0] - R[0, 1]
+    axis = np.array([rx, ry, rz], dtype=np.float64) / (2.0 * np.sin(theta))
+    return (axis * theta).astype(np.float64)
+
+
+def _extract_mano(
+    hand_entry: dict,
+) -> tuple[list[float], list[float], list[float]] | None:
+    """Read real MANO params → (pose_aa[45], betas[10], global_orient[3]).
+
+    The source ``hand_pose`` is 15 joints × 3×3 rotation matrices; we convert
+    each to axis-angle so it matches the LeRobot state layout's ``mano_pose_aa``
+    (45-dim) convention. Returns None if the block is missing or malformed.
+    """
+    mp = hand_entry.get("mano_parameters")
+    if not isinstance(mp, dict):
+        return None
+    pose = mp.get("hand_pose")
+    betas = mp.get("betas")
+    g = mp.get("global_orient")
+    if not (isinstance(pose, list) and len(pose) == 15):
+        return None
+    if not (isinstance(betas, list) and len(betas) == 10):
+        return None
+    if not (isinstance(g, list) and len(g) == 3):
+        return None
+    pose_aa: list[float] = []
+    for joint in pose:
+        R = np.asarray(joint, dtype=np.float64)
+        if R.shape != (3, 3) or not np.all(np.isfinite(R)):
+            return None
+        pose_aa.extend(_rotmat_to_aa(R).tolist())
+    return (
+        pose_aa,
+        [float(b) for b in betas],
+        [float(x) for x in g],
+    )
 
 
 def annotate(
@@ -153,6 +216,8 @@ def annotate(
         right_wrist: tuple[float, float, float] | None = None
         left_kpts: list[tuple[float, float, float]] | None = None
         right_kpts: list[tuple[float, float, float]] | None = None
+        left_mano: tuple[list[float], list[float], list[float]] | None = None
+        right_mano: tuple[list[float], list[float], list[float]] | None = None
 
         if entry is None:
             excluded = True
@@ -166,16 +231,19 @@ def annotate(
                 conf = str(hand_entry.get("confidence", ""))
                 kpts = _extract_keypoints(hand_entry)
                 wrist_xyz = tuple(kpts[0]) if kpts else None
+                mano = _extract_mano(hand_entry)
                 if is_right:
                     right_present = True
                     right_conf = conf
                     right_wrist = wrist_xyz
                     right_kpts = kpts
+                    right_mano = mano
                 else:
                     left_present = True
                     left_conf = conf
                     left_wrist = wrist_xyz
                     left_kpts = kpts
+                    left_mano = mano
 
         # When cfg.tail_exclude is False, ignore tail exclusion.
         if not cfg.tail_exclude and exclude_reason == "tail":
@@ -196,6 +264,12 @@ def annotate(
                 right_wrist_xyz=right_wrist,
                 left_keypoints_3d=left_kpts,
                 right_keypoints_3d=right_kpts,
+                left_mano_pose_aa=left_mano[0] if left_mano else None,
+                left_mano_betas=left_mano[1] if left_mano else None,
+                left_global_orient=left_mano[2] if left_mano else None,
+                right_mano_pose_aa=right_mano[0] if right_mano else None,
+                right_mano_betas=right_mano[1] if right_mano else None,
+                right_global_orient=right_mano[2] if right_mano else None,
             )
         )
 

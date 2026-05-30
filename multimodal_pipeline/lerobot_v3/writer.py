@@ -371,9 +371,14 @@ class LeRobotV3DatasetWriter:
             self._data_rows.append(row)
 
         self._state_stats.update(state)
-        # Action stats placeholder when disabled — pass a zeros block of correct shape.
+        # Real action stats: derive the action vector from this episode's state
+        # sequence via the canonical convention (lerobot_v3.actions), so the
+        # action mean/std in meta/stats.json reflect the actual transitions a
+        # dataloader will compute — not a zeros placeholder.
         if self._action_stats.enabled:
-            self._action_stats.update(np.zeros((T, ACTION_DIM), dtype=np.float32))
+            from .actions import compute_action_from_state
+
+            self._action_stats.update(compute_action_from_state(state))
 
         # 6. Episode video re-encode via ffmpeg (submitted to the parallel pool;
         #    result harvested in finalize()).

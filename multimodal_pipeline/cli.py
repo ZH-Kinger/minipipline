@@ -155,6 +155,23 @@ def _add_visualize(sp: argparse._SubParsersAction) -> None:
                    help="Episode index to render (repeatable). Default: first 3.")
     p.add_argument("--depth", action="store_true",
                    help="Also render the depth stream as a side-by-side colormap.")
+    p.add_argument("--compare", action="store_true",
+                   help="Prepend the raw (unannotated) RGB panel for side-by-side comparison.")
+    p.add_argument("--pointcloud", action="store_true",
+                   help="Render a 3D depth point-cloud + hand-keypoint world view (PNG) instead of the overlay MP4.")
+    p.add_argument("--mano", action="store_true",
+                   help="Render the MANO hand-mesh overlay (PNG). Needs torch+smplx and the "
+                        "MANO model files in $MMPIPE_MANO_DIR (default ./models/mano/).")
+    p.add_argument("--all", action="store_true", dest="combined",
+                   help="Render one synced 2x2 MP4: raw | keypoints+axes / MANO mesh | depth. "
+                        "Everything in a single VLC window. Needs MANO (see --mano).")
+    p.add_argument("--3d", action="store_true", dest="threed",
+                   help="GPU-render a crisp 3D video (Open3D/EGL): scene point-cloud + MANO "
+                        "hand meshes from an orbiting camera. Needs open3d + MANO.")
+    p.add_argument("--world", action="store_true", dest="world",
+                   help="One frame-locked MP4 with EVERY view in a single VLC window (3x2 grid): "
+                        "raw | keypoints+axes | depth / MANO mesh | 3D world | 3D keypoint fit. "
+                        "Needs open3d + MANO.")
     p.add_argument("--out", type=Path, default=None,
                    help="Output dir (default: <dataset_root>/viz).")
 
@@ -837,8 +854,40 @@ def _cmd_visualize(args: argparse.Namespace) -> int:
     if not (root / "meta" / "info.json").exists():
         print(f"Not a LeRobot v3 dataset (missing {root / 'meta' / 'info.json'}).")
         return 1
+    if getattr(args, "world", False):
+        from .viz3d import render_world_synced
+        out_dir = args.out or (root / "viz")
+        eps = args.episode if args.episode else list(range(min(3, json.loads((root / "meta" / "info.json").read_text())["total_episodes"])))
+        written = [render_world_synced(root, ep, out_dir) for ep in eps]
+        print(f"Rendered {len(written)} synced world video(s):")
+        for p in written:
+            print(f"  {p}")
+        return 0
+    if getattr(args, "threed", False):
+        from .viz3d import render_3d_video
+        out_dir = args.out or (root / "viz")
+        eps = args.episode if args.episode else list(range(min(3, json.loads((root / "meta" / "info.json").read_text())["total_episodes"])))
+        written = [render_3d_video(root, ep, out_dir) for ep in eps]
+        print(f"Rendered {len(written)} 3D video(s):")
+        for p in written:
+            print(f"  {p}")
+        return 0
+
+    if args.mano or args.combined:
+        from .viz_mano import render_mano_overlay, render_combined
+        out_dir = args.out or (root / "viz")
+        eps = args.episode if args.episode else list(range(min(3, json.loads((root / "meta" / "info.json").read_text())["total_episodes"])))
+        fn = render_combined if args.combined else render_mano_overlay
+        written = [fn(root, ep, out_dir) for ep in eps]
+        kind = "combined 2x2" if args.combined else "MANO-mesh overlay"
+        print(f"Rendered {len(written)} {kind}:")
+        for p in written:
+            print(f"  {p}")
+        return 0
+
     written = visualize_dataset(
-        root, episodes=args.episode, with_depth=bool(args.depth), out_dir=args.out,
+        root, episodes=args.episode, with_depth=bool(args.depth),
+        with_raw=bool(args.compare), pointcloud=bool(args.pointcloud), out_dir=args.out,
     )
     print(f"Rendered {len(written)} overlay video(s):")
     for p in written:

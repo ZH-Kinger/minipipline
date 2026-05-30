@@ -25,3 +25,6 @@ quality_*.json
 .env
 .env.local
 logs/
+
+# Licensed MANO model assets (download yourself from https://mano.is.tue.mpg.de).
+models/

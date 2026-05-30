@@ -136,6 +136,12 @@ def _write_hand_keypoints_parquet(out_path: Path, annotated: AnnotatedData) -> N
             return [float("nan"), float("nan"), float("nan")]
         return [float(coord[0]), float(coord[1]), float(coord[2])]
 
+    def _mano_vec(val: list[float] | None, dim: int) -> list[float]:
+        """Real MANO field flattened, NaN-filled to `dim` when absent."""
+        if val is None or len(val) != dim:
+            return [float("nan")] * dim
+        return [float(x) for x in val]
+
     table = pa.table(
         {
             "frame_index": pa.array(np.arange(n, dtype=np.int64), type=pa.int64()),
@@ -165,6 +171,32 @@ def _write_hand_keypoints_parquet(out_path: Path, annotated: AnnotatedData) -> N
             ),
             "left_keypoints_3d_flat": pa.array(left_kpts, type=pa.list_(pa.float32())),
             "right_keypoints_3d_flat": pa.array(right_kpts, type=pa.list_(pa.float32())),
+            # Real MANO params (camera frame). NaN-filled when the source frame
+            # has no mano_parameters; downstream masks on NaN / *_present.
+            "left_mano_pose_aa": pa.array(
+                [_mano_vec(f.left_mano_pose_aa, 45) for f in annotated.hand_frames],
+                type=pa.list_(pa.float32()),
+            ),
+            "right_mano_pose_aa": pa.array(
+                [_mano_vec(f.right_mano_pose_aa, 45) for f in annotated.hand_frames],
+                type=pa.list_(pa.float32()),
+            ),
+            "left_mano_betas": pa.array(
+                [_mano_vec(f.left_mano_betas, 10) for f in annotated.hand_frames],
+                type=pa.list_(pa.float32()),
+            ),
+            "right_mano_betas": pa.array(
+                [_mano_vec(f.right_mano_betas, 10) for f in annotated.hand_frames],
+                type=pa.list_(pa.float32()),
+            ),
+            "left_global_orient": pa.array(
+                [_mano_vec(f.left_global_orient, 3) for f in annotated.hand_frames],
+                type=pa.list_(pa.float32()),
+            ),
+            "right_global_orient": pa.array(
+                [_mano_vec(f.right_global_orient, 3) for f in annotated.hand_frames],
+                type=pa.list_(pa.float32()),
+            ),
         }
     )
     out_path.parent.mkdir(parents=True, exist_ok=True)

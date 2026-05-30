@@ -83,6 +83,19 @@ def rotmat_to_axis_angle(R: np.ndarray) -> np.ndarray:
     return (axis * theta).astype(np.float64)
 
 
+def axis_angle_to_rotmat(aa: np.ndarray) -> np.ndarray:
+    """(3,) axis-angle → 3×3 rotation matrix (Rodrigues exp map)."""
+    theta = float(np.linalg.norm(aa))
+    if theta < 1e-8:
+        return np.eye(3, dtype=np.float64)
+    k = aa / theta
+    K = np.array(
+        [[0.0, -k[2], k[1]], [k[2], 0.0, -k[0]], [-k[1], k[0], 0.0]],
+        dtype=np.float64,
+    )
+    return np.eye(3) + np.sin(theta) * K + (1.0 - np.cos(theta)) * (K @ K)
+
+
 def _wrist_orientation_aa(kp_world: np.ndarray) -> np.ndarray:
     """Derive a wrist axis-angle orientation from world-frame keypoint geometry.
 
@@ -211,6 +224,44 @@ def _read_keypoints(nir_dir: Path, n_frames: int) -> tuple[np.ndarray, np.ndarra
     return kp, valid
 
 
+def _read_mano(
+    nir_dir: Path, n_frames: int
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Read real MANO params from hand_keypoints.parquet.
+
+    Returns ``(pose (2,N,45), betas (2,N,10), global_orient (2,N,3))``,
+    NaN-filled where a frame/hand has no MANO block (or the column is absent,
+    e.g. NIR produced before this field existed).
+    """
+    pose = np.full((2, n_frames, 45), np.nan, dtype=np.float64)
+    betas = np.full((2, n_frames, 10), np.nan, dtype=np.float64)
+    gorient = np.full((2, n_frames, 3), np.nan, dtype=np.float64)
+    p = nir_dir / "hand_keypoints.parquet"
+    if not p.exists():
+        return pose, betas, gorient
+    d = pq.read_table(p).to_pydict()
+    cols = set(d.keys())
+    if "left_mano_pose_aa" not in cols:  # older NIR without MANO columns
+        return pose, betas, gorient
+    idx = d["frame_index"]
+    for j, fi in enumerate(idx):
+        fi = int(fi)
+        if not (0 <= fi < n_frames):
+            continue
+        for hand, pre, po, be, go in (
+            (HAND_LEFT, "left_present", "left_mano_pose_aa", "left_mano_betas", "left_global_orient"),
+            (HAND_RIGHT, "right_present", "right_mano_pose_aa", "right_mano_betas", "right_global_orient"),
+        ):
+            for arr, key, dim in ((pose, po, 45), (betas, be, 10), (gorient, go, 3)):
+                v = d.get(key, [None] * len(idx))[j]
+                if v is None:
+                    continue
+                a = np.asarray(v, dtype=np.float64)
+                if a.shape[0] == dim and np.all(np.isfinite(a)):
+                    arr[hand, fi] = a
+    return pose, betas, gorient
+
+
 # ---------------------------------------------------------------------------
 # Assembly
 # ---------------------------------------------------------------------------
@@ -241,15 +292,29 @@ def build_merged_from_nir(nir_dir: str | Path, video: VideoMeta) -> MergedPredic
     pred_trans = kp_world[:, :, 0, :].astype(np.float32)        # wrist = kp 0
     pred_trans = np.nan_to_num(pred_trans)                      # zero-fill invalid
 
-    # Wrist orientation (world frame) from keypoint geometry.
+    # Real MANO from the source tracker (camera frame).
+    mano_pose, mano_betas, mano_gorient = _read_mano(nir_dir, n)  # (2,N,45),(2,N,10),(2,N,3)
+
+    # MANO 15-joint finger pose is wrist-local (frame-independent) → use directly.
+    pred_hand_pose = np.nan_to_num(mano_pose).astype(np.float32)   # zero where absent
+    pred_betas = np.nan_to_num(mano_betas).astype(np.float32)
+
+    # Wrist orientation (world frame). Prefer real MANO global_orient (camera
+    # frame) rotated into world by the per-frame head pose: R_world = R_c2w @
+    # R(global_orient). Fall back to keypoint-geometry estimate when the MANO
+    # block is absent for that frame/hand.
     pred_rot = np.zeros((2, n, 3), dtype=np.float32)
     for hand in (HAND_LEFT, HAND_RIGHT):
         for i in range(n):
-            if valid[hand, i]:
+            if not valid[hand, i]:
+                continue
+            g = mano_gorient[hand, i]
+            if np.all(np.isfinite(g)):
+                R_world = R[i] @ axis_angle_to_rotmat(g)
+                pred_rot[hand, i] = rotmat_to_axis_angle(R_world).astype(np.float32)
+            else:
                 pred_rot[hand, i] = _wrist_orientation_aa(kp_world[hand, i]).astype(np.float32)
 
-    pred_hand_pose = np.zeros((2, n, 45), dtype=np.float32)     # MANO AA not fitted
-    pred_betas = np.zeros((2, n, 10), dtype=np.float32)
     pred_kept = valid.copy()
 
     trajectory = CameraTrajectory(

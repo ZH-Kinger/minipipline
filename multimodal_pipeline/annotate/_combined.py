@@ -36,7 +36,10 @@ from .actions import _normalise_action_output
 
 _log = logging.getLogger(__name__)
 
-_DEFAULT_VLM_CONFIDENCE = 0.8
+# Placeholder score returned by the backend; the orchestrator overrides it with
+# a measured per-clip reliability score (hand-detection coverage × frame
+# quality), so the VLM's poorly-calibrated self-confidence is not used.
+_DEFAULT_VLM_CONFIDENCE = 0.5
 # Greedy {...} match — supports nested objects (CoT reasoning may contain
 # braces in quoted strings, but tolerant parsing below handles it).
 _JSON_BLOCK_RE = re.compile(r"\{.*\}", re.DOTALL)
@@ -152,19 +155,28 @@ class DashScopeCombinedAnnotator:
         video_path: Path,
         wrist_speed: np.ndarray | None = None,
     ) -> tuple[str, str, float]:
+        # Adaptive frame budget: scale by clip duration so short clips don't ship
+        # redundant frames (quality-neutral — caps at max_clip_frames for rich
+        # clips). Falls back to the fixed max when adaptive_frames is off.
+        n_target = self.hyper.max_clip_frames
+        if getattr(self.hyper, "adaptive_frames", False):
+            dur = max(0.0, t_end_s - t_start_s)
+            n_target = int(round(dur * self.hyper.adaptive_sample_fps))
+            n_target = max(self.hyper.min_clip_frames, min(self.hyper.max_clip_frames, n_target))
+
         frame_indices: list[int] | None = None
         if (
             getattr(self.cfg, "frame_sampling", "uniform") == "motion_peak"
             and wrist_speed is not None
         ):
             frame_indices = pick_motion_peak_indices(
-                wrist_speed, frame_start, frame_end, self.hyper.max_clip_frames,
+                wrist_speed, frame_start, frame_end, n_target,
             )
         frames = extract_clip_frames(
             video_path,
             t_start_s=t_start_s,
             t_end_s=t_end_s,
-            max_frames=self.hyper.max_clip_frames,
+            max_frames=n_target,
             long_edge_px=self.hyper.max_frame_resize_long_edge,
             frame_indices=frame_indices,
         )
@@ -189,10 +201,12 @@ class DashScopeCombinedAnnotator:
         if desc is None and action_raw is None:
             # Total parse failure — keep the clip alive with a marker so the
             # batch doesn't die.
-            return (raw.replace("\n", " ").strip()[:60] or "[parse-fail]", "move", 0.5)
+            return (raw.replace("\n", " ").strip()[:60] or "[parse-fail]", "move", _DEFAULT_VLM_CONFIDENCE)
 
         text = (desc or "").replace("\n", " ").strip() or "[empty]"
         label = _normalise_action_output(action_raw or "") if action_raw else "move"
+        # Score is a placeholder here; the orchestrator overrides action_score
+        # with a measured reliability proxy (coverage × frame quality).
         return text, label, _DEFAULT_VLM_CONFIDENCE
 
 

@@ -21,6 +21,7 @@ import hashlib
 import json
 import time
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -35,6 +36,87 @@ from .actions import DashScopeActionLabeler, build_action_labeler
 from .language import DashScopeLanguageAnnotator, build_language_annotator
 from .quality import build_quality_scorer
 from .schemas import AnnotateRunResult, ClipAnnotation, FrameQualityRow
+
+
+def _apply_reliability_scores(
+    clips: list[ClipAnnotation],
+    hand_visible: np.ndarray,
+    frame_quality: list[FrameQualityRow],
+    wrist_speed: np.ndarray | None = None,
+) -> list[ClipAnnotation]:
+    """Override ``action_score`` with a measured per-clip reliability proxy.
+
+    ``score = hand_coverage × mean_frame_quality × motion_saliency``, each in
+    [0,1]:
+      - hand_coverage    = fraction of clip frames with a detected hand
+        (real keypoint validity) — how well the action is actually observed.
+      - mean_frame_quality = mean rule-based ``overall_quality`` (blur/exposure).
+      - motion_saliency  = clip mean wrist speed / session p90 wrist speed,
+        clipped to [0,1] — distinguishes a clear action (reach/grasp/move) from
+        a near-static "rest/wait" clip. 1.0 when no motion signal is available.
+
+    Replaces the VLM's poorly-calibrated self-confidence with a signal that is
+    locally measured, varies per clip, and reflects annotation reliability.
+    """
+    if not clips:
+        return clips
+    n = len(frame_quality)
+    qual = np.full(n, np.nan, dtype=np.float64)
+    for r in frame_quality:
+        if 0 <= r.frame_idx < n:
+            qual[r.frame_idx] = r.overall_quality
+    # Robust session-level motion reference (p90) so saliency is relative to how
+    # much this session moves; guard against all-static / missing signal.
+    speed_ref = 0.0
+    if wrist_speed is not None and wrist_speed.size:
+        speed_ref = float(np.percentile(wrist_speed, 90))
+    out: list[ClipAnnotation] = []
+    for c in clips:
+        fs, fe = c.frame_start, c.frame_end
+        if fe <= fs:
+            out.append(replace(c, action_score=0.0))
+            continue
+        hv = hand_visible[fs:fe] if hand_visible is not None else None
+        coverage = float(np.mean(hv)) if hv is not None and len(hv) else 1.0
+        qsl = qual[fs:fe]
+        qsl = qsl[np.isfinite(qsl)]
+        quality = float(np.mean(qsl)) if qsl.size else 1.0
+        saliency = 1.0
+        if wrist_speed is not None and speed_ref > 1e-9:
+            seg = wrist_speed[fs:min(fe, wrist_speed.shape[0])]
+            if seg.size:
+                saliency = float(np.clip(np.mean(seg) / speed_ref, 0.0, 1.0))
+        out.append(replace(c, action_score=round(coverage * quality * saliency, 4)))
+    return out
+
+
+def _build_task_context(task: dict) -> str:
+    """Build a rich task context string for the VLM prompt from task.json.
+
+    Folds the overall task name plus the session's ``steps`` / ``items`` /
+    ``hints`` / scene from ``task_info`` into one line, so the VLM can ground
+    object names (e.g. "padlock", "key") instead of guessing. Empty fields are
+    omitted. Falls back to the bare task name / task_text when nothing else is
+    available.
+    """
+    name = task.get("task_text") or task.get("task_info", {}).get("name", "")
+    ti = task.get("task_info", {}) or {}
+    parts: list[str] = []
+    if name:
+        parts.append(str(name))
+    steps = [str(s) for s in (ti.get("steps") or []) if str(s).strip()]
+    if steps:
+        parts.append("steps: " + "; ".join(steps))
+    items = [str(s) for s in (ti.get("items") or []) if str(s).strip()]
+    if items:
+        parts.append("objects: " + ", ".join(items))
+    hints = [str(s) for s in (ti.get("hints") or []) if str(s).strip()]
+    if hints:
+        parts.append("hints: " + "; ".join(hints))
+    scene = ti.get("task_scene") or ti.get("scene")
+    if scene and str(scene).strip():
+        parts.append("scene: " + str(scene))
+    return " | ".join(parts) if parts else (name or "")
 
 
 def _video_id_from_path(path: Path) -> str:
@@ -189,7 +271,7 @@ def run_annotate_pipeline(
     media_paths = json.loads((nir_dir / "media_paths.json").read_text(encoding="utf-8"))
     video_path = Path(media_paths["media"]["rgb"])
     task = json.loads((nir_dir / "task.json").read_text(encoding="utf-8"))
-    task_text = task.get("task_text") or task.get("task_info", {}).get("name", "")
+    task_text = _build_task_context(task)
 
     t = time.perf_counter()
     n_frames, fps = _read_frame_index(nir_dir)
@@ -303,6 +385,11 @@ def run_annotate_pipeline(
         hand_visible=hand_visible,
     )
     timings["quality"] = time.perf_counter() - t
+
+    # Replace the placeholder action_score with a measured reliability proxy
+    # (hand-detection coverage × mean frame quality) now that frame_quality is
+    # available. This is a real, per-clip, locally-computed signal.
+    clips = _apply_reliability_scores(clips, hand_visible, frame_quality, wrist_speed)
 
     # Persist into NIR.
     t = time.perf_counter()

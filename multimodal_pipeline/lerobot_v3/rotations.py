@@ -27,6 +27,24 @@ def axis_angle_to_rotmat(aa: np.ndarray) -> np.ndarray:
     return out.reshape(*leading, 3, 3)
 
 
+def rotmat_to_axis_angle(R: np.ndarray) -> np.ndarray:
+    """3×3 rotation matrix → (3,) axis-angle (Rodrigues log map), robust near 0/π."""
+    R = np.asarray(R, dtype=np.float64)
+    cos_theta = float(np.clip((np.trace(R) - 1.0) * 0.5, -1.0, 1.0))
+    theta = np.arccos(cos_theta)
+    if theta < 1e-6:
+        return np.zeros(3, dtype=np.float32)
+    if abs(np.pi - theta) < 1e-3:
+        A = (R + np.eye(3)) * 0.5
+        k = int(np.argmax(np.diag(A)))
+        axis = A[:, k] / np.sqrt(max(A[k, k], 1e-12))
+        axis = axis / (np.linalg.norm(axis) + 1e-12)
+        return (axis * theta).astype(np.float32)
+    rx, ry, rz = R[2, 1] - R[1, 2], R[0, 2] - R[2, 0], R[1, 0] - R[0, 1]
+    axis = np.array([rx, ry, rz], dtype=np.float64) / (2.0 * np.sin(theta))
+    return (axis * theta).astype(np.float32)
+
+
 def single_aa_per_frame_to_flat_rotmat(aa_seq: np.ndarray) -> np.ndarray:
     """`(T, 3)` axis-angle per frame → `(T, 9)` flattened rotation matrix per frame."""
     aa_seq = np.asarray(aa_seq, dtype=np.float32)
@@ -52,6 +70,7 @@ def joint_aa_per_frame_to_flat_rotmat(aa_seq: np.ndarray) -> np.ndarray:
 
 __all__ = [
     "axis_angle_to_rotmat",
+    "rotmat_to_axis_angle",
     "single_aa_per_frame_to_flat_rotmat",
     "joint_aa_per_frame_to_flat_rotmat",
 ]
