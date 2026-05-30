@@ -421,7 +421,10 @@ def render_world_synced(dataset_root: Path, ep_idx: int, out_dir: Path, *,
     import open3d as o3d
     from open3d.visualization import rendering
     import pyarrow.parquet as pq
-    from .visualize import _decode_rgb as _vd_rgb, _decode_depth_gray16, _BONES
+    from PIL import Image, ImageDraw
+    from .visualize import (_decode_rgb as _vd_rgb, _decode_depth_gray16, _BONES,
+                            _draw_hand, _draw_wrist_axes, _project,
+                            _LEFT_COLOR, _RIGHT_COLOR)
     _patch_numpy_for_chumpy()
     import smplx
 
@@ -539,7 +542,17 @@ def render_world_synced(dataset_root: Path, ep_idx: int, out_dir: Path, *,
             if not _valid(t, hd):
                 kp_masked[hd] = np.nan
 
-        raw = _label(rgb[t].copy(), "raw RGB")
+        # --- RGB with the 2D skeleton + wrist axes drawn on it (the fit check) ---
+        ov = Image.fromarray(rgb[t].copy()); od = ImageDraw.Draw(ov)
+        _draw_hand(od, _project(kp_masked[0], fx, fy, cx, cy), _LEFT_COLOR)
+        _draw_hand(od, _project(kp_masked[1], fx, fy, cx, cy), _RIGHT_COLOR)
+        st = states[t]
+        if st.shape[0] >= 67:
+            if _valid(t, 0):
+                _draw_wrist_axes(od, st[0:3], st[3:6], fx, fy, cx, cy)
+            if _valid(t, 1):
+                _draw_wrist_axes(od, st[61:64], st[64:67], fx, fy, cx, cy)
+        raw = _label(np.asarray(ov), "RGB + skeleton fit")
 
         # --- 3D keypoint fit: solid spheres + cylinders ---
         ren.scene.clear_geometry()
