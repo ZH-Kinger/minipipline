@@ -196,16 +196,19 @@ def _median_depth(depth_u16):
     return median_filter(depth_u16, size=5)
 
 
-def _hand_bbox_mask(depth, kp, valid, fx, fy, cx, cy, pad=100):
-    """Zero out depth around each valid hand, extended down toward the image
-    bottom to also cut the forearm (egocentric arms enter from the bottom).
+def _hand_bbox_mask(depth, kp, valid, fx, fy, cx, cy, pad=70):
+    """Zero out depth over each valid hand AND its forearm.
 
-    Keeps the moving hands AND arms OUT of the fused static world (they'd
-    otherwise smear across the work area). Multi-frame fusion refills the table
-    from frames where the hand is elsewhere. Returns a copy.
+    The hand is covered by a disc at every joint; the forearm by a thick band
+    drawn from the wrist along the palm→wrist direction out to the image edge
+    (so diagonal arms — not just vertical ones — are removed). Keeps the moving
+    hands/arms OUT of the fused static world; multi-frame fusion refills the
+    table from frames where the arm is elsewhere. Returns a copy.
     """
-    out = depth.copy()
+    from PIL import Image, ImageDraw
     h, w = depth.shape
+    m = Image.new("L", (w, h), 0); md = ImageDraw.Draw(m)
+    diag = float(np.hypot(w, h))
     for hand in range(2):
         if not valid(hand):
             continue
@@ -214,15 +217,23 @@ def _hand_bbox_mask(depth, kp, valid, fx, fy, cx, cy, pad=100):
         ok = np.isfinite(z) & (z > 1e-3)
         if not ok.any():
             continue
-        u = fx * p[ok, 0] / z[ok] + cx
-        v = fy * p[ok, 1] / z[ok] + cy
-        x0 = max(0, int(u.min()) - pad); x1 = min(w, int(u.max()) + pad)
-        y0 = max(0, int(v.min()) - pad); yhb = min(h, int(v.max()) + pad)
-        out[y0:yhb, x0:x1] = 0                       # hand
-        # forearm: a wider band from the hand down to the image bottom (the arm
-        # fans out wider than the hand and enters from below in egocentric view).
-        fx0 = max(0, x0 - 2 * pad); fx1 = min(w, x1 + 2 * pad)
-        out[yhb:h, fx0:fx1] = 0
+        u = fx * p[:, 0] / np.where(z != 0, z, 1) + cx
+        v = fy * p[:, 1] / np.where(z != 0, z, 1) + cy
+        # hand: a disc at every finite joint
+        for j in range(21):
+            if ok[j]:
+                md.ellipse([u[j] - pad, v[j] - pad, u[j] + pad, v[j] + pad], fill=255)
+        # forearm: thick band from the wrist out along the palm→wrist axis
+        mcp = [j for j in (5, 9, 13, 17) if ok[j]]
+        if ok[0] and mcp:
+            wr = np.array([u[0], v[0]])
+            palm = np.array([u[mcp].mean(), v[mcp].mean()])
+            d = wr - palm; n = np.linalg.norm(d)
+            if n > 1e-3:
+                far = wr + d / n * diag
+                md.line([tuple(wr), tuple(far)], fill=255, width=int(2.4 * pad))
+    out = depth.copy()
+    out[np.asarray(m) > 0] = 0
     return out
 
 
@@ -262,14 +273,18 @@ def _fuse_world(o3d, rgb, depth, w2c, fx, fy, cx, cy, kps, valids, T, ref, *,
                 wc = kps[t][hd, 0]
                 centers.append(c2w[t][:3, :3] @ wc + c2w[t][:3, 3])  # wrist in world
     mesh = vol.extract_triangle_mesh()
+    ctr = np.median(np.array(centers), axis=0) if centers else None
+    mesh = _clean_mesh(o3d, mesh, ctr, roi, max_tris)
+    mesh.transform(w2c[ref])  # world -> ref-camera frame
+    mesh.compute_vertex_normals()
+    return mesh
 
-    # --- clean the noisy single-view reconstruction ---
-    # 1) crop to the workspace ROI around the hands (drop torn far/edge shards)
-    if centers:
-        ctr = np.median(np.array(centers), axis=0)
+
+def _clean_mesh(o3d, mesh, ctr, roi, max_tris):
+    """Crop to a workspace ROI, drop small clusters, decimate, Taubin-smooth."""
+    if ctr is not None:
         bb = o3d.geometry.AxisAlignedBoundingBox(ctr - roi, ctr + roi)
         mesh = mesh.crop(bb)
-    # 2) drop small disconnected triangle clusters (flying fragments)
     if len(mesh.triangles):
         idx, ntri, _ = mesh.cluster_connected_triangles()
         idx = np.asarray(idx); ntri = np.asarray(ntri)
@@ -280,11 +295,154 @@ def _fuse_world(o3d, rgb, depth, w2c, fx, fy, cx, cy, kps, valids, T, ref, *,
     if len(mesh.triangles) > max_tris:
         mesh = mesh.simplify_quadric_decimation(max_tris)
     mesh.remove_degenerate_triangles()
-    # 3) Taubin smoothing: denoise the bumpy surface without shrinking it
     if len(mesh.triangles):
         mesh = mesh.filter_smooth_taubin(number_of_iterations=12)
-    mesh.transform(w2c[ref])  # world -> ref-camera frame
+    return mesh
+
+
+# ---------------------------------------------------------------------------
+# A1: whole-session fusion. The per-clip TSDF (above) is starved — one clip is
+# ~60 maskable frames over a ~5cm baseline. The full session (NIR source video)
+# is ~700 frames over a ~35cm baseline, so fusing it yields a far more complete,
+# cleaner world. NIR head_pose is the single consistent world frame for both the
+# fusion and the per-clip camera (lerobot extrinsics_w2c is per-episode-relative,
+# so it is NOT used here). Result is cached to <session>/world_session.ply.
+# ---------------------------------------------------------------------------
+
+
+def _nir_dir(dataset_root):
+    """The sibling NIR session dir (<session>/nir/<sess>/), or None."""
+    cands = sorted((dataset_root.parent / "nir").glob("*/head_pose.parquet"))
+    return cands[0].parent if cands else None
+
+
+def _quat_to_R(qx, qy, qz, qw):
+    n = math.sqrt(qx * qx + qy * qy + qz * qz + qw * qw) or 1.0
+    qx, qy, qz, qw = qx / n, qy / n, qz / n, qw / n
+    return np.array([
+        [1 - 2 * (qy * qy + qz * qz), 2 * (qx * qy - qz * qw), 2 * (qx * qz + qy * qw)],
+        [2 * (qx * qy + qz * qw), 1 - 2 * (qx * qx + qz * qz), 2 * (qy * qz - qx * qw)],
+        [2 * (qx * qz - qy * qw), 2 * (qy * qz + qx * qw), 1 - 2 * (qx * qx + qy * qy)],
+    ], dtype=np.float64)
+
+
+def _load_head_poses(nir_dir):
+    """frame_index -> 4×4 camera-to-world (head_pose stores camera position + quat)."""
+    import pyarrow.parquet as pq
+    hp = pq.read_table(nir_dir / "head_pose.parquet").to_pydict()
+    out = {}
+    for i, fidx in enumerate(hp["frame_index"]):
+        M = np.eye(4)
+        M[:3, :3] = _quat_to_R(hp["qx"][i], hp["qy"][i], hp["qz"][i], hp["qw"][i])
+        M[:3, 3] = [hp["tx"][i], hp["ty"][i], hp["tz"][i]]
+        out[int(fidx)] = M
+    return out
+
+
+def _load_nir_keypoints(nir_dir):
+    """frame_index -> ((2,21,3) cam-frame keypoints, (present_l, present_r))."""
+    import pyarrow.parquet as pq
+    t = pq.read_table(nir_dir / "hand_keypoints.parquet").to_pydict()
+    out = {}
+    for i, fidx in enumerate(t["frame_index"]):
+        kp = np.full((2, 21, 3), np.nan)
+        for hd, key in ((0, "left_keypoints_3d_flat"), (1, "right_keypoints_3d_flat")):
+            v = t[key][i]
+            if v is not None:
+                a = np.asarray(v, dtype=np.float64)
+                if a.size == 63:
+                    kp[hd] = a.reshape(21, 3)
+        out[int(fidx)] = (kp, (bool(t["left_present"][i]), bool(t["right_present"][i])))
+    return out
+
+
+def _readn(stream, n):
+    buf = b""
+    while len(buf) < n:
+        chunk = stream.read(n - len(buf))
+        if not chunk:
+            break
+        buf += chunk
+    return buf
+
+
+def _session_world_mesh(o3d, nir_dir, ffmpeg, *, voxel=0.006, trunc=2.2,
+                        max_tris=260000, roi=1.3, cache=True):
+    """Fuse the whole NIR session into one world-frame mesh (cached on disk).
+
+    Streams the full RGB + depth session video (low memory), masking each frame's
+    present hands/arms and skipping frames with an unmaskable (present-but-
+    keypoint-less) hand. Returns an Open3D TriangleMesh in the head_pose WORLD
+    frame, or None if assets are missing."""
+    cache_path = nir_dir.parent.parent / "world_session.ply"
+    if cache and cache_path.exists():
+        m = o3d.io.read_triangle_mesh(str(cache_path))
+        if len(m.triangles):
+            m.compute_vertex_normals()
+            return m
+    mp = json.loads((nir_dir / "media_paths.json").read_text(encoding="utf-8"))
+    rgb_path = Path(mp["media"]["rgb"]); dep_path = Path(mp["media"]["depth"])
+    if not (rgb_path.exists() and dep_path.exists()):
+        return None
+    cal = json.loads((nir_dir / "calibration.json").read_text(encoding="utf-8"))["rgb"]
+    w, h = int(cal["width"]), int(cal["height"])
+    fx, fy, cx, cy = float(cal["fx"]), float(cal["fy"]), float(cal["cx"]), float(cal["cy"])
+    poses = _load_head_poses(nir_dir)
+    kpd = _load_nir_keypoints(nir_dir)
+
+    vol = o3d.pipelines.integration.ScalableTSDFVolume(
+        voxel_length=voxel, sdf_trunc=4 * voxel,
+        color_type=o3d.pipelines.integration.TSDFVolumeColorType.RGB8)
+    intr = o3d.camera.PinholeCameraIntrinsic(w, h, fx, fy, cx, cy)
+
+    rgb_proc = subprocess.Popen(
+        [str(ffmpeg), "-v", "error", "-i", str(rgb_path), "-f", "rawvideo",
+         "-pix_fmt", "rgb24", "-"], stdout=subprocess.PIPE)
+    dep_proc = subprocess.Popen(
+        [str(ffmpeg), "-v", "error", "-i", str(dep_path), "-f", "rawvideo",
+         "-pix_fmt", "gray16le", "-"], stdout=subprocess.PIPE)
+    rfb, dfb = w * h * 3, w * h * 2
+    fidx, centers, n_int = 0, [], 0
+    while True:
+        rb = _readn(rgb_proc.stdout, rfb)
+        db = _readn(dep_proc.stdout, dfb)
+        if len(rb) < rfb or len(db) < dfb:
+            break
+        pose = poses.get(fidx); kpe = kpd.get(fidx)
+        if pose is not None and kpe is not None:
+            kp, present = kpe
+            fin = [np.all(np.isfinite(kp[hd])) for hd in (0, 1)]
+            # skip frames with a present-but-unmaskable hand (would fuse the arm)
+            if not ((present[0] and not fin[0]) or (present[1] and not fin[1])):
+                rgb_f = np.frombuffer(rb, np.uint8).reshape(h, w, 3)
+                dep_f = np.frombuffer(db, "<u2").reshape(h, w)
+                dep_m = _median_depth(dep_f)
+                dep_m = _hand_bbox_mask(dep_m, kp,
+                                        lambda hd: present[hd] and fin[hd], fx, fy, cx, cy)
+                rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(
+                    o3d.geometry.Image(np.ascontiguousarray(rgb_f)),
+                    o3d.geometry.Image(np.ascontiguousarray(dep_m.astype(np.uint16))),
+                    depth_scale=1000.0, depth_trunc=trunc, convert_rgb_to_intensity=False)
+                w2c = np.linalg.inv(pose)
+                vol.integrate(rgbd, intr, w2c)
+                n_int += 1
+                for hd in (0, 1):
+                    if present[hd] and fin[hd]:
+                        centers.append(pose[:3, :3] @ kp[hd, 0] + pose[:3, 3])
+        fidx += 1
+    rgb_proc.stdout.close(); dep_proc.stdout.close()
+    rgb_proc.wait(); dep_proc.wait()
+    if n_int == 0:
+        return None
+    mesh = vol.extract_triangle_mesh()
+    ctr = np.median(np.array(centers), axis=0) if centers else None
+    mesh = _clean_mesh(o3d, mesh, ctr, roi, max_tris)
     mesh.compute_vertex_normals()
+    if cache and len(mesh.triangles):
+        try:
+            o3d.io.write_triangle_mesh(str(cache_path), mesh)
+        except Exception:
+            pass
     return mesh
 
 
@@ -405,12 +563,15 @@ def render_world_synced(dataset_root: Path, ep_idx: int, out_dir: Path, *,
         [ raw RGB           | 3D keypoint skeleton fit       ]
         [ wrist trajectory  | 3D world (fused mesh + MANO)   ]
 
-    Quality build: the world tile is a **TSDF-fused** scene mesh — the whole
-    clip's median-filtered depth is integrated with the real per-frame
-    ``extrinsics_w2c`` (hands masked out) into one clean, hole-filled surface,
-    expressed in a reference frame's camera coordinates. The per-frame MANO hands
-    (camera-frame fit, wrist pinned to the real keypoint) are rigidly carried
-    into that reference frame, so the hands move within a static world model.
+    Quality build (A1): the world tile is a **whole-session TSDF-fused** mesh —
+    the full NIR session video (~700 frames over a ~35cm head baseline, vs one
+    clip's ~60 frames / ~5cm) is integrated in the NIR head_pose world frame
+    (hands+forearms masked out), giving a far more complete, cleaner surface,
+    cached at ``<session>/world_session.ply``. It is then expressed in the clip's
+    reference-camera frame. The per-frame MANO hands (camera-frame fit, wrist
+    pinned to the real keypoint) are rigidly carried into that reference frame
+    via head_pose, so the hands move within a static world model. Falls back to
+    per-clip fusion when NIR is unavailable.
     3D keypoints are solid spheres+cylinders. Both 3D tiles are supersampled
     (``ss``×) and downscaled (Lanczos) for crisp, anti-aliased edges; the MP4 is
     H.264 ``-preset slow -crf 16``. Needs open3d + MANO + scipy + matplotlib + ffmpeg.
@@ -466,18 +627,33 @@ def render_world_synced(dataset_root: Path, ep_idx: int, out_dir: Path, *,
     # hand (its camera coords anchor the fused mesh + the hand transforms).
     valid_frames = [t for t in range(T) if _valid(t, 0) or _valid(t, 1)]
     ref = valid_frames[len(valid_frames) // 2] if valid_frames else T // 2
-    c2w = [np.linalg.inv(m) for m in w2c] if w2c is not None else None
-    def _T_ref(t):  # camera(t) -> reference-camera frame
-        if w2c is None:
-            return np.eye(4)
-        return w2c[ref] @ c2w[t]
 
-    # --- Fuse the static world mesh (ref-camera frame) ---
+    # --- A1: prefer the whole-session fused world (NIR head_pose frame), which is
+    # far more complete than the per-clip TSDF. Falls back to per-clip fusion (or
+    # nothing) when NIR / depth is unavailable. ---
+    nir = _nir_dir(dataset_root)
+    head = _load_head_poses(nir) if nir is not None else None
+    gfid = [int(data["frame_index"][rows[t]]) for t in range(T)] if "frame_index" in data else None
     world_mesh = None
-    if depth is not None and w2c is not None:
-        depth_stack = depth[:T]
-        world_mesh = _fuse_world(o3d, rgb[:T], depth_stack, w2c, fx, fy, cx, cy,
-                                 kps, _valid, T, ref)
+    if head is not None and gfid is not None and all(g in head for g in gfid):
+        ref_g = gfid[ref]
+        w2c_ref = np.linalg.inv(head[ref_g])
+        def _T_ref(t):  # camera(t) -> reference-camera frame, via head_pose world
+            return w2c_ref @ head[gfid[t]]
+        session_mesh = _session_world_mesh(o3d, nir, ffb.ffmpeg)  # world frame
+        if session_mesh is not None and len(session_mesh.triangles):
+            session_mesh.transform(w2c_ref)  # world -> ref-camera frame
+            session_mesh.compute_vertex_normals()
+            world_mesh = session_mesh
+    else:
+        c2w = [np.linalg.inv(m) for m in w2c] if w2c is not None else None
+        def _T_ref(t):  # camera(t) -> reference-camera frame
+            if w2c is None:
+                return np.eye(4)
+            return w2c[ref] @ c2w[t]
+        if depth is not None and w2c is not None:
+            world_mesh = _fuse_world(o3d, rgb[:T], depth[:T], w2c, fx, fy, cx, cy,
+                                     kps, _valid, T, ref)
 
     # --- Two supersampled offscreen renderers (world + keypoints) ---
     RW, RH = w * ss, h * ss
@@ -585,7 +761,7 @@ def render_world_synced(dataset_root: Path, ep_idx: int, out_dir: Path, *,
             ren.scene.add_geometry(f"hand_{side}", mesh, hand_mat[hand])
         _aim(ren, t, tgt_w)
         world = _downscale(np.asarray(ren.render_to_image())[:, :, :3].astype(np.uint8), w, h)
-        world = _label(world, "3D world (TSDF + MANO)")
+        world = _label(world, "3D world (session fuse + MANO)")
 
         top = np.concatenate([raw, kp3d], axis=1)
         bot = np.concatenate([traj, world], axis=1)
