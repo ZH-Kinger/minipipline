@@ -23,7 +23,10 @@ from multimodal_pipeline.viz3d import render_world_synced
 _REPO = Path(__file__).resolve().parents[1]
 OUT_ROOT = _REPO / "output"
 GALLERY = _REPO / "artifacts" / "gallery"
-N = 10
+# Number of sessions to sample (evenly spread). Pass "all" or a count as argv[1];
+# default 10. "all" covers every processed session.
+N = (10 if len(sys.argv) < 2
+     else (10 ** 9 if sys.argv[1].lower() == "all" else int(sys.argv[1])))
 
 
 def _both_hands_frame(ds: Path) -> tuple[int, int]:
