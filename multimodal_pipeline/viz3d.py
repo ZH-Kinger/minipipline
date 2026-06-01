@@ -366,14 +366,90 @@ def _readn(stream, n):
     return buf
 
 
+def _iter_session_frames(o3d, ffmpeg, rgb_path, dep_path, w, h, fx, fy, cx, cy,
+                         poses, kpd, trunc):
+    """Yield (fidx, rgbd, c2w, wrist_centers) for each maskable session frame.
+
+    Streams the full RGB+depth video (low memory). Skips frames with an
+    unmaskable present hand; masks the present hands/arms out of the depth."""
+    rgb_proc = subprocess.Popen(
+        [str(ffmpeg), "-v", "error", "-i", str(rgb_path), "-f", "rawvideo",
+         "-pix_fmt", "rgb24", "-"], stdout=subprocess.PIPE)
+    dep_proc = subprocess.Popen(
+        [str(ffmpeg), "-v", "error", "-i", str(dep_path), "-f", "rawvideo",
+         "-pix_fmt", "gray16le", "-"], stdout=subprocess.PIPE)
+    rfb, dfb = w * h * 3, w * h * 2
+    fidx = 0
+    try:
+        while True:
+            rb = _readn(rgb_proc.stdout, rfb)
+            db = _readn(dep_proc.stdout, dfb)
+            if len(rb) < rfb or len(db) < dfb:
+                break
+            pose = poses.get(fidx); kpe = kpd.get(fidx)
+            if pose is not None and kpe is not None:
+                kp, present = kpe
+                fin = [np.all(np.isfinite(kp[hd])) for hd in (0, 1)]
+                if not ((present[0] and not fin[0]) or (present[1] and not fin[1])):
+                    rgb_f = np.frombuffer(rb, np.uint8).reshape(h, w, 3)
+                    dep_f = np.frombuffer(db, "<u2").reshape(h, w)
+                    dep_m = _median_depth(dep_f)
+                    dep_m = _hand_bbox_mask(dep_m, kp,
+                                            lambda hd: present[hd] and fin[hd], fx, fy, cx, cy)
+                    rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(
+                        o3d.geometry.Image(np.ascontiguousarray(rgb_f)),
+                        o3d.geometry.Image(np.ascontiguousarray(dep_m.astype(np.uint16))),
+                        depth_scale=1000.0, depth_trunc=trunc, convert_rgb_to_intensity=False)
+                    centers = [pose[:3, :3] @ kp[hd, 0] + pose[:3, 3]
+                               for hd in (0, 1) if present[hd] and fin[hd]]
+                    yield fidx, rgbd, pose, centers
+            fidx += 1
+    finally:
+        rgb_proc.stdout.close(); dep_proc.stdout.close()
+        rgb_proc.wait(); dep_proc.wait()
+
+
+def _icp_refine(o3d, rgbd, intr, c2w_init, target, *, max_corr=0.03,
+                max_trans=0.08, max_rot_deg=8.0):
+    """Frame-to-model point-to-plane ICP. Returns a refined c2w, or the initial
+    one if ICP is untrustworthy (low fitness / implausibly large correction)."""
+    # Source cloud from the (masked) frame depth, in the camera frame.
+    src = o3d.geometry.PointCloud.create_from_depth_image(
+        rgbd.depth, intr, depth_scale=1000.0, depth_trunc=3.0)
+    if len(src.points) < 500:
+        return c2w_init
+    src = src.voxel_down_sample(0.01)
+    reg = o3d.pipelines.registration.registration_icp(
+        src, target, max_corr, c2w_init,
+        o3d.pipelines.registration.TransformationEstimationPointToPlane(),
+        o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=25))
+    T = reg.transformation
+    if reg.fitness < 0.3:
+        return c2w_init
+    delta = np.linalg.inv(c2w_init) @ T
+    dt = float(np.linalg.norm(delta[:3, 3]))
+    dr = math.degrees(math.acos(max(-1.0, min(1.0, (np.trace(delta[:3, :3]) - 1) / 2))))
+    if dt > max_trans or dr > max_rot_deg:
+        return c2w_init
+    return T
+
+
 def _session_world_mesh(o3d, nir_dir, ffmpeg, *, voxel=0.006, trunc=2.2,
-                        max_tris=260000, roi=1.3, cache=True):
+                        max_tris=260000, roi=1.3, cache=True, icp=None):
     """Fuse the whole NIR session into one world-frame mesh (cached on disk).
 
-    Streams the full RGB + depth session video (low memory), masking each frame's
-    present hands/arms and skipping frames with an unmaskable (present-but-
-    keypoint-less) hand. Returns an Open3D TriangleMesh in the head_pose WORLD
-    frame, or None if assets are missing."""
+    Two passes when ICP refinement is on (default; MMPIPE_WORLD_ICP=0 to disable):
+    pass A fuses with raw head_pose to build a reference model M0; each frame is
+    then snapped onto M0 with frame-to-model point-to-plane ICP (head_pose as the
+    initial guess, large corrections rejected); pass B re-fuses with the refined
+    poses for a sharper, less ghosted surface. Returns a TriangleMesh in the
+    head_pose WORLD frame, or None if assets are missing."""
+    # ICP refinement is OFF by default: empirically it gives ~no improvement on
+    # this data (head_pose is already an accurate tracked pose, and the
+    # plane-dominated scene gives point-to-plane ICP little leverage) at ~3× the
+    # cost. Kept available via MMPIPE_WORLD_ICP=1 for noisier-pose sources.
+    if icp is None:
+        icp = os.environ.get("MMPIPE_WORLD_ICP", "0").strip().lower() in {"1", "true", "yes"}
     cache_path = nir_dir.parent.parent / "world_session.ply"
     if cache and cache_path.exists():
         m = o3d.io.read_triangle_mesh(str(cache_path))
@@ -389,52 +465,40 @@ def _session_world_mesh(o3d, nir_dir, ffmpeg, *, voxel=0.006, trunc=2.2,
     fx, fy, cx, cy = float(cal["fx"]), float(cal["fy"]), float(cal["cx"]), float(cal["cy"])
     poses = _load_head_poses(nir_dir)
     kpd = _load_nir_keypoints(nir_dir)
-
-    vol = o3d.pipelines.integration.ScalableTSDFVolume(
-        voxel_length=voxel, sdf_trunc=4 * voxel,
-        color_type=o3d.pipelines.integration.TSDFVolumeColorType.RGB8)
     intr = o3d.camera.PinholeCameraIntrinsic(w, h, fx, fy, cx, cy)
 
-    rgb_proc = subprocess.Popen(
-        [str(ffmpeg), "-v", "error", "-i", str(rgb_path), "-f", "rawvideo",
-         "-pix_fmt", "rgb24", "-"], stdout=subprocess.PIPE)
-    dep_proc = subprocess.Popen(
-        [str(ffmpeg), "-v", "error", "-i", str(dep_path), "-f", "rawvideo",
-         "-pix_fmt", "gray16le", "-"], stdout=subprocess.PIPE)
-    rfb, dfb = w * h * 3, w * h * 2
-    fidx, centers, n_int = 0, [], 0
-    while True:
-        rb = _readn(rgb_proc.stdout, rfb)
-        db = _readn(dep_proc.stdout, dfb)
-        if len(rb) < rfb or len(db) < dfb:
-            break
-        pose = poses.get(fidx); kpe = kpd.get(fidx)
-        if pose is not None and kpe is not None:
-            kp, present = kpe
-            fin = [np.all(np.isfinite(kp[hd])) for hd in (0, 1)]
-            # skip frames with a present-but-unmaskable hand (would fuse the arm)
-            if not ((present[0] and not fin[0]) or (present[1] and not fin[1])):
-                rgb_f = np.frombuffer(rb, np.uint8).reshape(h, w, 3)
-                dep_f = np.frombuffer(db, "<u2").reshape(h, w)
-                dep_m = _median_depth(dep_f)
-                dep_m = _hand_bbox_mask(dep_m, kp,
-                                        lambda hd: present[hd] and fin[hd], fx, fy, cx, cy)
-                rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(
-                    o3d.geometry.Image(np.ascontiguousarray(rgb_f)),
-                    o3d.geometry.Image(np.ascontiguousarray(dep_m.astype(np.uint16))),
-                    depth_scale=1000.0, depth_trunc=trunc, convert_rgb_to_intensity=False)
-                w2c = np.linalg.inv(pose)
-                vol.integrate(rgbd, intr, w2c)
-                n_int += 1
-                for hd in (0, 1):
-                    if present[hd] and fin[hd]:
-                        centers.append(pose[:3, :3] @ kp[hd, 0] + pose[:3, 3])
-        fidx += 1
-    rgb_proc.stdout.close(); dep_proc.stdout.close()
-    rgb_proc.wait(); dep_proc.wait()
+    def _frames():
+        return _iter_session_frames(o3d, ffmpeg, rgb_path, dep_path, w, h,
+                                    fx, fy, cx, cy, poses, kpd, trunc)
+
+    def _fuse(pose_for):
+        vol = o3d.pipelines.integration.ScalableTSDFVolume(
+            voxel_length=voxel, sdf_trunc=4 * voxel,
+            color_type=o3d.pipelines.integration.TSDFVolumeColorType.RGB8)
+        centers, n = [], 0
+        for fidx, rgbd, c2w, cs in _frames():
+            vol.integrate(rgbd, intr, np.linalg.inv(pose_for(fidx, rgbd, c2w)))
+            centers.extend(cs); n += 1
+        return vol, centers, n
+
+    # Pass A: raw head_pose → reference model M0.
+    volA, centers, n_int = _fuse(lambda fidx, rgbd, c2w: c2w)
     if n_int == 0:
         return None
-    mesh = vol.extract_triangle_mesh()
+
+    refined = {}
+    if icp:
+        m0 = volA.extract_triangle_mesh(); m0.compute_vertex_normals()
+        target = o3d.geometry.PointCloud()
+        target.points = m0.vertices; target.normals = m0.vertex_normals
+        target = target.voxel_down_sample(0.01)
+        for fidx, rgbd, c2w, cs in _frames():
+            refined[fidx] = _icp_refine(o3d, rgbd, intr, c2w, target)
+        volB, centers, _ = _fuse(lambda fidx, rgbd, c2w: refined.get(fidx, c2w))
+        mesh = volB.extract_triangle_mesh()
+    else:
+        mesh = volA.extract_triangle_mesh()
+
     ctr = np.median(np.array(centers), axis=0) if centers else None
     mesh = _clean_mesh(o3d, mesh, ctr, roi, max_tris)
     mesh.compute_vertex_normals()
