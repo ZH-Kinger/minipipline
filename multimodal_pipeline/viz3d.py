@@ -367,11 +367,13 @@ def _readn(stream, n):
 
 
 def _iter_session_frames(o3d, ffmpeg, rgb_path, dep_path, w, h, fx, fy, cx, cy,
-                         poses, kpd, trunc):
+                         poses, kpd, trunc, stride=1):
     """Yield (fidx, rgbd, c2w, wrist_centers) for each maskable session frame.
 
     Streams the full RGB+depth video (low memory). Skips frames with an
-    unmaskable present hand; masks the present hands/arms out of the depth."""
+    unmaskable present hand; masks the present hands/arms out of the depth.
+    ``stride`` integrates only every Nth frame (a ~35cm baseline has plenty of
+    redundancy, so stride=2 roughly halves fusion cost with negligible loss)."""
     rgb_proc = subprocess.Popen(
         [str(ffmpeg), "-v", "error", "-i", str(rgb_path), "-f", "rawvideo",
          "-pix_fmt", "rgb24", "-"], stdout=subprocess.PIPE)
@@ -386,6 +388,9 @@ def _iter_session_frames(o3d, ffmpeg, rgb_path, dep_path, w, h, fx, fy, cx, cy,
             db = _readn(dep_proc.stdout, dfb)
             if len(rb) < rfb or len(db) < dfb:
                 break
+            if fidx % stride != 0:  # still consumed the bytes above (keep streams synced)
+                fidx += 1
+                continue
             pose = poses.get(fidx); kpe = kpd.get(fidx)
             if pose is not None and kpe is not None:
                 kp, present = kpe
@@ -435,7 +440,7 @@ def _icp_refine(o3d, rgbd, intr, c2w_init, target, *, max_corr=0.03,
 
 
 def _session_world_mesh(o3d, nir_dir, ffmpeg, *, voxel=0.006, trunc=2.2,
-                        max_tris=260000, roi=1.3, cache=True, icp=None):
+                        max_tris=260000, roi=1.3, cache=True, icp=None, stride=None):
     """Fuse the whole NIR session into one world-frame mesh (cached on disk).
 
     Two passes when ICP refinement is on (default; MMPIPE_WORLD_ICP=0 to disable):
@@ -450,6 +455,10 @@ def _session_world_mesh(o3d, nir_dir, ffmpeg, *, voxel=0.006, trunc=2.2,
     # cost. Kept available via MMPIPE_WORLD_ICP=1 for noisier-pose sources.
     if icp is None:
         icp = os.environ.get("MMPIPE_WORLD_ICP", "0").strip().lower() in {"1", "true", "yes"}
+    # Fuse every Nth frame (default 2): the wide head baseline is highly
+    # redundant, so this ~halves fusion cost with negligible quality loss.
+    if stride is None:
+        stride = max(1, int(os.environ.get("MMPIPE_WORLD_STRIDE", "2")))
     cache_path = nir_dir.parent.parent / "world_session.ply"
     if cache and cache_path.exists():
         m = o3d.io.read_triangle_mesh(str(cache_path))
@@ -469,7 +478,7 @@ def _session_world_mesh(o3d, nir_dir, ffmpeg, *, voxel=0.006, trunc=2.2,
 
     def _frames():
         return _iter_session_frames(o3d, ffmpeg, rgb_path, dep_path, w, h,
-                                    fx, fy, cx, cy, poses, kpd, trunc)
+                                    fx, fy, cx, cy, poses, kpd, trunc, stride=stride)
 
     def _fuse(pose_for):
         vol = o3d.pipelines.integration.ScalableTSDFVolume(
@@ -508,6 +517,23 @@ def _session_world_mesh(o3d, nir_dir, ffmpeg, *, voxel=0.006, trunc=2.2,
         except Exception:
             pass
     return mesh
+
+
+def prefuse_world_cache(dataset_root):
+    """Build (and disk-cache) the session world mesh, WITHOUT any GPU rendering.
+
+    Fusion is pure-CPU (TSDF + scipy), so this is safe to run across processes in
+    parallel — unlike the Open3D offscreen *render*, which deadlocks on a shared
+    GPU when run concurrently. The gallery pre-fuses caches in parallel via this,
+    then renders serially. Returns the session uuid8, or None if NIR is absent."""
+    import open3d as o3d
+    ds = Path(dataset_root)
+    nir = _nir_dir(ds)
+    if nir is None:
+        return None
+    ffb = check_ffmpeg()
+    _session_world_mesh(o3d, nir, ffb.ffmpeg)
+    return ds.parent.name[:8]
 
 
 def _cyl(o3d, p, q, r):
