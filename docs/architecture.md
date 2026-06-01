@@ -17,7 +17,7 @@
   Layer 2 (handpose)            Layer 1.5 (annotate)
   MergedPrediction +            ClipAnnotation +
   AtomicActions                 FrameQualityRow
-  （mock | real backend）        （mock | dashscope | rule_based）
+  （real_ingest | mock）         （mock | dashscope | rule_based）
        │                              │
        └──────────────┬───────────────┘
                       ▼
@@ -95,12 +95,21 @@
 
 ## Layer 2 — Hand Pose Features (`multimodal_pipeline.handpose`)
 
-**当前为 mock**。所有 5 个模型后端都通过 BLAKE2b 派生的种子产生**确定性**的随机张量，shape 与真实模型一致。
+**默认 backend 为 `real_ingest`**（`MMPIPE_HANDPOSE_BACKEND=real_ingest`，当前生产配置）。它**不跑也不 mock** 5 阶段模型链，而是直接从 Layer 1 已抽好的 NIR 真值组装 `MergedPrediction`：
+
+- 真实 3D 手部关键点（相机系，米）→ 经每帧头部位姿 c2w 变换到世界系（`p_world = R(q) @ p_cam + t`）
+- 真实头部 6DOF 轨迹 → 每帧 camera-to-world
+- 真实 MANO 参数（pose / betas / global_orient，来自源 tracker）→ 直接用；缺失帧才退化为由关键点几何估计腕部朝向
+- 真实相机内参（Kalibr）→ K
+
+world→camera 往返应复现原始相机系坐标，作为内置正确性自检。实现见 `handpose/real_ingest.py`，编排器在 `MMPIPE_HANDPOSE_BACKEND=real_ingest` 时走 fast path 跳过模型链。
 
 **输入**：NIR 会话目录。
 **输出**：`MergedPrediction`（视频级 MANO 参数 + 相机轨迹）+ `list[AtomicAction]`（基于手腕 3D 速度极小值切分）。
 
-**7 阶段流水**：
+> **可选 mock backend（默认不启用）**：设 `MMPIPE_HANDPOSE_BACKEND=mock` 时，5 个模型后端通过 BLAKE2b 派生种子产生**确定性**随机张量（shape 与真实模型一致），仅用于在没有真实模型权重时调通链路。生产数据**不使用** mock。下方 7 阶段流水描述的是 mock / 未来真实模型链的拓扑；`real_ingest` 直接绕过它。
+
+**7 阶段流水**（mock / 未来真实模型链）：
 
 ```
 4.0 video probe (ffprobe)

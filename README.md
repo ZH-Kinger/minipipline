@@ -3,7 +3,7 @@
 通用多模态人类示范数据管线。**4 层叠加架构**：
 
 1. **Layer 1 — ITW Ingest** — 从原始会话目录摄取多模态文件，时间对齐、坐标统一、有效性标记，输出 NIR + WebDataset tar
-2. **Layer 2 — Hand Pose Features**（当前 mock，可切真模型）— 7 阶段模型链（GeoCalib + MoGe-2 + HaWoR + MegaSAM）输出手部 MANO 参数与相机轨迹
+2. **Layer 2 — Hand Pose Features**（默认 `real_ingest`，从 NIR 真值组装；mock 仅兜底）— `real_ingest` 直接用 Layer 1 抽出的真实手部关键点 / 头部 6DOF / MANO / 内参装配相机轨迹与 MANO 参数，不跑也不 mock 7 阶段模型链（GeoCalib + MoGe-2 + HaWoR + MegaSAM）
 3. **Layer 1.5 — Annotate**（mock / DashScope Qwen-VL / OpenCV-style）— 给每个 atomic clip 贴语言描述 + 动作类别；给每帧打模糊/曝光质量分（3 个 component：`language` / `actions` / `quality`）
 4. **Layer 3 — LeRobot v3 Pack** — 装配为 LeRobot v3 标准数据集，含 per-clip 语言、per-frame `action_label` / `action_score`，附 dataloader 读回校验
 
@@ -125,8 +125,9 @@ MMPIPE_QUALITY_BACKEND=rule_based
 MMPIPE_DASHSCOPE_API_KEY=sk-你的真实key
 MMPIPE_DASHSCOPE_MODEL=qwen-vl-max     # 或 qwen-vl-plus（便宜约 2.5×）
 
-# Layer 2 — 暂时全 mock（接真模型时改对应行 + 填 weights 路径）
-MMPIPE_HANDPOSE_BACKEND=mock
+# Layer 2 — real_ingest：从 NIR 真值组装（生产默认，不跑模型链、不 mock）
+# 想在没有真实模型权重时只调通链路才改成 mock；接真实 5 模型链时改对应行 + 填 weights 路径
+MMPIPE_HANDPOSE_BACKEND=real_ingest
 ```
 
 DashScope API key 在 [DashScope 控制台](https://dashscope.console.aliyun.com/apiKey) 创建。
