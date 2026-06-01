@@ -28,3 +28,6 @@ logs/
 
 # Licensed MANO model assets (download yourself from https://mano.is.tue.mpg.de).
 models/
+
+# Generated verification artifacts (gallery videos + render logs).
+artifacts/

@@ -20,8 +20,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from multimodal_pipeline.viz_mano import render_mano_overlay
 from multimodal_pipeline.viz3d import render_world_synced
 
-OUT_ROOT = Path.home() / "桌面" / "minipipline" / "output"
-GALLERY = Path.home() / "桌面" / "verify"
+_REPO = Path(__file__).resolve().parents[1]
+OUT_ROOT = _REPO / "output"
+GALLERY = _REPO / "artifacts" / "gallery"
 N = 10
 
 
