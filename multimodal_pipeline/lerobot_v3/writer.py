@@ -32,6 +32,8 @@ from .schema import (
     STATE_LAYOUT,
     STATE_MASK_DIM,
     HAND_KEYPOINTS_DIM,
+    ROBOT_QPOS_DIM,
+    ROBOT_EE_POSE_DIM,
     WRIST_TRANSL_DIM,
     build_data_schema,
     build_episodes_schema,
@@ -140,6 +142,10 @@ class EpisodeInput:
     # Optional per-frame IMU (T, 6) and audio contact phase (T,) int.
     imu_per_frame: np.ndarray | None = None
     contact_phase: np.ndarray | None = None
+    # Layer 2.5 robot retarget targets (T, 46) full-joint qpos + (T, 12) EE pose.
+    # None → NaN-filled column (hand had no real keypoints / retarget disabled).
+    robot_qpos: np.ndarray | None = None
+    robot_ee_pose: np.ndarray | None = None
 
     @property
     def length(self) -> int:
@@ -327,6 +333,18 @@ class LeRobotV3DatasetWriter:
                 base = hand * (21 * 3)
                 hand_kp_cam[:, base:base + 21 * 3] = cam
 
+        # 4c. Robot retarget targets (Layer 2.5): NaN-filled when absent, so the
+        #     columns are always present and downstream can mask on NaN — exactly
+        #     like observation.hand_keypoints above.
+        robot_qpos = (
+            ep.robot_qpos.astype(np.float32) if ep.robot_qpos is not None
+            else np.full((T, ROBOT_QPOS_DIM), np.nan, dtype=np.float32)
+        )
+        robot_ee_pose = (
+            ep.robot_ee_pose.astype(np.float32) if ep.robot_ee_pose is not None
+            else np.full((T, ROBOT_EE_POSE_DIM), np.nan, dtype=np.float32)
+        )
+
         # 5. Per-frame rows.
         ep_global_start = self._next_global_index
         extrinsics_flat = ep.extrinsics_w2c.reshape(T, EXTRINSICS_FLAT_DIM).astype(np.float32)
@@ -357,6 +375,8 @@ class LeRobotV3DatasetWriter:
                 "right_seg_start": -1,
                 "right_seg_end": -1,
                 "observation.hand_keypoints": hand_kp_cam[t].tolist(),
+                "observation.robot_qpos": robot_qpos[t].tolist(),
+                "observation.robot_ee_pose": robot_ee_pose[t].tolist(),
                 "observation.imu": (
                     ep.imu_per_frame[t].astype(np.float32).tolist()
                     if ep.imu_per_frame is not None

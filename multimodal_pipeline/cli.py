@@ -34,6 +34,7 @@ _KNOWN_COMMANDS = {
     "handpose",
     "annotate",
     "lerobot",
+    "retarget-check",
     "validate",
     "lerobot-validate",  # legacy alias
     "doctor",
@@ -126,6 +127,15 @@ def _add_lerobot(sp: argparse._SubParsersAction) -> None:
     p.add_argument("nir_dir", type=Path)
     p.add_argument("dataset_root", type=Path, nargs="?", default=None)
     p.add_argument("--config", type=Path)
+    p.add_argument("--handpose-config", type=Path)
+
+
+def _add_retarget_check(sp: argparse._SubParsersAction) -> None:
+    p = sp.add_parser(
+        "retarget-check",
+        help="Layer 2.5: retarget human hands -> Wuji robot and report fit quality (mm/%).",
+    )
+    p.add_argument("nir_dir", type=Path, help="A NIR directory (Layer 1 output).")
     p.add_argument("--handpose-config", type=Path)
 
 
@@ -226,6 +236,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_handpose(sp)
     _add_annotate(sp)
     _add_lerobot(sp)
+    _add_retarget_check(sp)
     _add_visualize(sp)
     _add_quality_report(sp)
     _add_legacy(sp)
@@ -394,6 +405,23 @@ def _cmd_lerobot(args: argparse.Namespace) -> int:
             "data_files": report.data_files,
         }
     )
+    return 0
+
+
+def _cmd_retarget_check(args: argparse.Namespace) -> int:
+    from .handpose import HandPoseConfig, run_handpose_pipeline
+    from .config.retarget import RetargetConfig
+    from .retarget import self_check
+
+    cfg = HandPoseConfig.from_file(args.handpose_config)
+    result = run_handpose_pipeline(args.nir_dir, cfg)
+    m = result.merged
+    if m.hand_keypoints_world is None:
+        print("No real hand keypoints (mock chain) — retarget needs a real "
+              "keypoint source (MMPIPE_HANDPOSE_BACKEND=real_ingest).")
+        return 1
+    summary = self_check(m.hand_keypoints_world, m.pred_kept, RetargetConfig.from_env())
+    _print_json(summary)
     return 0
 
 
@@ -933,6 +961,7 @@ _DISPATCH = {
     "handpose": _cmd_handpose,
     "annotate": _cmd_annotate,
     "lerobot": _cmd_lerobot,
+    "retarget-check": _cmd_retarget_check,
     "validate": _cmd_validate,
     "lerobot-validate": _cmd_validate,
     "doctor": _cmd_doctor,

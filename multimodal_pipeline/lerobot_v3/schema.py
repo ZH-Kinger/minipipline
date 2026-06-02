@@ -28,6 +28,14 @@ HAND_KP_COUNT = 21                              # MANO-style keypoints per hand
 HAND_KEYPOINTS_DIM = 2 * HAND_KP_COUNT * 3      # 126 = 2 hands × 21 × 3 (camera frame)
 IMU_DIM = 6                                     # acc xyz + gyro xyz, per frame
 
+# Robot-side retarget targets (Layer 2.5). Dual-arm Wuji: each arm is 3 arm
+# joints + 20 hand joints (WH120). robot_qpos is directly executable; ee_pose is
+# the embodiment-agnostic end-effector (per hand: transl xyz + orient axis-angle).
+# NaN-filled when a hand has no real keypoints (mock) or is not kept in a frame —
+# never a placeholder (see observation.hand_keypoints).
+ROBOT_QPOS_DIM = 46     # left_arm 3 + left_hand 20 + right_arm 3 + right_hand 20
+ROBOT_EE_POSE_DIM = 12  # 2 hands × (transl 3 + orient_aa 3)
+
 
 # State vector layout: [left 61 | right 61]. Each slice is (start, end_exclusive).
 STATE_LAYOUT: dict[str, tuple[int, int]] = {
@@ -39,6 +47,23 @@ STATE_LAYOUT: dict[str, tuple[int, int]] = {
     "right_wrist_orient_cam_aa":(64, 67),
     "right_mano_pose_aa":       (67, 112),
     "right_mano_betas":         (112, 122),
+}
+
+
+# Robot full-joint vector layout (directly executable angles, radians).
+ROBOT_QPOS_LAYOUT: dict[str, tuple[int, int]] = {
+    "left_arm":   (0, 3),
+    "left_hand":  (3, 23),
+    "right_arm":  (23, 26),
+    "right_hand": (26, 46),
+}
+
+# Robot end-effector pose layout (embodiment-agnostic, per hand).
+ROBOT_EE_LAYOUT: dict[str, tuple[int, int]] = {
+    "left_ee_transl":     (0, 3),
+    "left_ee_orient_aa":  (3, 6),
+    "right_ee_transl":    (6, 9),
+    "right_ee_orient_aa": (9, 12),
 }
 
 
@@ -105,6 +130,10 @@ def build_data_schema() -> pa.Schema:
         # Per-frame IMU (acc xyz + gyro xyz) and audio-derived contact phase.
         pa.field("observation.imu", _vec(IMU_DIM)),
         pa.field("observation.contact_phase", pa.int8()),
+        # Layer 2.5 robot retarget targets. All-NaN per hand when no real
+        # keypoints / not kept (honest mask, never a placeholder).
+        pa.field("observation.robot_qpos", _vec(ROBOT_QPOS_DIM)),
+        pa.field("observation.robot_ee_pose", _vec(ROBOT_EE_POSE_DIM)),
         # Layer 1.5 annotation fields (constant across an episode's frames).
         pa.field("action_label", pa.string()),
         pa.field("action_score", pa.float32()),
@@ -206,6 +235,8 @@ def build_info_dict(
             "observation.hand_keypoints": {"dtype": "float32", "shape": [HAND_KEYPOINTS_DIM]},
             "observation.imu": {"dtype": "float32", "shape": [IMU_DIM]},
             "observation.contact_phase": {"dtype": "int8", "shape": [1]},
+            "observation.robot_qpos": {"dtype": "float32", "shape": [ROBOT_QPOS_DIM]},
+            "observation.robot_ee_pose": {"dtype": "float32", "shape": [ROBOT_EE_POSE_DIM]},
             video_key: {
                 "dtype": "video",
                 "shape": [video_height, video_width, 3],
