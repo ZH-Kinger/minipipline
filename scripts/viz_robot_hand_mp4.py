@@ -41,46 +41,44 @@ _COL = {"left": (0, 180, 255), "right": (255, 140, 0)}
 _FMAP = (0, 1, 2, 3, 4)
 
 
-def _link_finger_scale(link: str, sv: np.ndarray) -> float:
-    m = re.search(r"finger(\d)", link)
-    return float(sv[int(m.group(1)) - 1]) if m else float(sv.mean())
+def _umeyama(src: np.ndarray, dst: np.ndarray):
+    """Similarity transform (s, R, t) minimising ‖s·R·src + t − dst‖ (Umeyama 1991)."""
+    src = np.asarray(src, float); dst = np.asarray(dst, float)
+    mu_s, mu_d = src.mean(0), dst.mean(0)
+    S, D = src - mu_s, dst - mu_d
+    cov = (D.T @ S) / len(src)
+    U, d, Vt = np.linalg.svd(cov)
+    E = np.eye(3)
+    if np.linalg.det(U @ Vt) < 0:
+        E[2, 2] = -1.0
+    R = U @ E @ Vt
+    var = (S ** 2).sum() / len(src)
+    s = float(np.trace(np.diag(d) @ E) / var) if var > 1e-12 else 1.0
+    t = mu_d - s * (R @ mu_s)
+    return s, R, t
 
 
-def _calibrate(model, K_hand, rows):
-    """Per-finger scale + Kabsch R_align in the camera frame, over the episode."""
-    vs = [_human_fingertip_vectors(K_hand[i], _FMAP) for i in rows if np.isfinite(K_hand[i]).all()]
-    vs = [v for v in vs if v is not None]
-    if not vs:
-        return None
-    Vbar = np.mean(vs, 0)
-    Vr = model.fingertips_local(model.tree.midpoint())
-    sv = np.linalg.norm(Vr, axis=1) / np.maximum(np.linalg.norm(Vbar, axis=1), 1e-6)
-    return kabsch_rotation(sv[:, None] * Vbar, Vr), sv
-
-
-def _overlay_hand(dr, model, q_hand, kp_cam, R_align, sv, intr, color):
-    """Draw the Wuji hand skeleton projected onto the image. Returns mean
-    fingertip pixel distance to the human keypoints (self-check), or None."""
-    basis = _hand_basis(kp_cam)
-    if basis is None:
-        return None
-    R_cam, wrist = basis
+def _overlay_hand(dr, model, q_hand, kp_cam, intr, color):
+    """Project the Wuji hand skeleton onto the image via a per-frame Umeyama fit
+    of its fingertips to the human fingertip keypoints. Returns mean fingertip
+    pixel distance (self-check) — the residual = how well the robot hand SHAPE
+    matches the human hand (no dependence on an episode-level alignment)."""
     frames, _ = model.tree.fk(q_hand)
     P = {ln: frames[ln][:3, 3] for ln in frames}
-
-    def to_cam(ln):
-        return wrist + R_cam @ (R_align.T @ P[ln] / _link_finger_scale(ln, sv))
-
-    proj = {ln: _project_pts(to_cam(ln)[None], *intr)[0] for ln in P}
+    rob = np.array([P[tl] for tl in model.tip_links])                        # palm-local (5,3)
+    hum = np.array([kp_cam[MANO_FINGERTIPS[_FMAP[i]]] for i in range(5)])     # camera (5,3)
+    if not np.isfinite(hum).all():
+        return None
+    s, R, t = _umeyama(rob, hum)
+    proj = {ln: _project_pts((s * (R @ P[ln]) + t)[None], *intr)[0] for ln in P}
     for j in model.tree.joints:
         a, b = proj[j.parent], proj[j.child]
         dr.line([a[0], a[1], b[0], b[1]], fill=color, width=3)
     for tl in model.tip_links:
         u, v = proj[tl]
         dr.ellipse([u - 4, v - 4, u + 4, v + 4], fill=color)
-    # self-check: projected Wuji tip vs human fingertip keypoint
     tip_px = np.array([proj[tl] for tl in model.tip_links])
-    hum_px = _project_pts(np.array([kp_cam[MANO_FINGERTIPS[_FMAP[i]]] for i in range(5)]), *intr)
+    hum_px = _project_pts(hum, *intr)
     return float(np.linalg.norm(tip_px - hum_px, axis=1).mean())
 
 
@@ -115,7 +113,8 @@ def main():
     rows = [i for i in range(len(ei)) if int(ei[i]) == args.episode]
 
     models = {"left": RobotModel("left"), "right": RobotModel("right")}
-    calib = {s: _calibrate(models[s], K[:, hi], rows) for hi, s in ((0, "left"), (1, "right"))}
+    # No episode-level calibration — each frame aligns the Wuji hand to the human
+    # fingertips via Umeyama, so a hard-to-fit hand never drags the whole hand off.
 
     ffb = check_ffmpeg()
     mp4 = root / "videos" / "observation.images.ego" / "chunk-000" / f"episode_{args.episode:06d}.mp4"
@@ -136,10 +135,9 @@ def main():
         for hi, side in ((0, "left"), (1, "right")):
             sl = lH if side == "left" else rH
             q = Q[gi, sl[0]:sl[1]]
-            if calib[side] is None or not np.isfinite(q).all() or not np.isfinite(K[gi, hi]).all():
+            if not np.isfinite(q).all() or not np.isfinite(K[gi, hi]).all():
                 continue
-            R_align, sv = calib[side]
-            err = _overlay_hand(dr, models[side], q, K[gi, hi], R_align, sv, intr, _COL[side])
+            err = _overlay_hand(dr, models[side], q, K[gi, hi], intr, _COL[side])
             if err is not None:
                 checks[side].append(err)
         proc.stdin.write(np.asarray(img).astype(np.uint8).tobytes())
