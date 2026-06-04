@@ -119,20 +119,26 @@ def _retarget_hand(
     V = np.stack(valid_vecs)                 # (Tk,5,3)
     Vbar = V.mean(axis=0)                    # (5,3) mean human layout (robot order)
     V_robot = model.fingertips_local(model.tree.midpoint())  # (5,3)
-    human_span = float(np.mean(np.linalg.norm(Vbar, axis=1)))
-    scale = scale_override if scale_override is not None else (
-        model._robot_span / human_span if human_span > 1e-6 else 1.0)
-    R_align = kabsch_rotation(Vbar, V_robot)
+    # Per-finger scale: human vs robot finger-length ratios differ, so one global
+    # scale can't match all 5 fingers. Scale each finger to its robot length,
+    # then align orientation in that scaled space (tighter than a single scale).
+    robot_len = np.linalg.norm(V_robot, axis=1)            # (5,)
+    human_len = np.linalg.norm(Vbar, axis=1)               # (5,)
+    if scale_override is not None:
+        scale_vec = np.full(5, float(scale_override))
+    else:
+        scale_vec = np.where(human_len > 1e-6, robot_len / human_len, 1.0)
+    R_align = kabsch_rotation(scale_vec[:, None] * Vbar, V_robot)
     diag["align_residual_mm"] = float(
-        np.mean(np.linalg.norm(scale * (Vbar @ R_align.T) - V_robot, axis=1)) * 1000)
-    diag["scale"] = scale
+        np.mean(np.linalg.norm(scale_vec[:, None] * (Vbar @ R_align.T) - V_robot, axis=1)) * 1000)
+    diag["scale"] = float(np.mean(scale_vec))
 
     lo, hi = model.hand_limits[:, 0], model.hand_limits[:, 1]
     prev = None
     prev_arm = None
     for t in valid_t:
         v = _human_fingertip_vectors(kp_seq[t], finger_map)
-        target = scale * (v @ R_align.T)      # (5,3) palm-local
+        target = scale_vec[:, None] * (v @ R_align.T)   # (5,3) palm-local, per-finger scaled
         q = solve_hand_qpos(model, target, q_init=prev, smooth_ref=prev,
                             smooth_weight=smooth_weight, n_iters=n_iters)
         qpos[t] = q
