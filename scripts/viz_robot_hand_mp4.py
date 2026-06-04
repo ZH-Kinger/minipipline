@@ -70,7 +70,8 @@ def _wuji_panel(models, qL, qR, w, h, dpi=100):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("dataset_root", type=Path)
-    ap.add_argument("--episode", type=int, default=0)
+    ap.add_argument("--episode", type=int, default=None,
+                    help="episode index; default = the one with most grasp frames")
     ap.add_argument("--out", type=Path, default=None)
     ap.add_argument("--fps", type=float, default=30.0)
     args = ap.parse_args()
@@ -83,6 +84,15 @@ def main():
     fxiy = (fx, fx, w / 2.0, h / 2.0)
 
     d = pq.read_table(root / "data" / "chunk-000" / "file-000.parquet").to_pydict()
+    if args.episode is None:  # pick the episode with the most grasp (finite-qpos) frames
+        best = (0, -1)
+        for ep in sorted(set(int(e) for e in d["episode_index"])):
+            r = [i for i, e in enumerate(d["episode_index"]) if int(e) == ep]
+            qq = np.array([d["observation.robot_qpos"][i] for i in r], float)
+            k = int(np.isfinite(qq).all(1).sum())
+            if k > best[1]:
+                best = (ep, k)
+        args.episode = best[0]
     rows = [i for i, e in enumerate(d["episode_index"]) if int(e) == args.episode]
     if not rows:
         print(f"episode {args.episode} not found"); return 1
@@ -99,7 +109,7 @@ def main():
 
     out_dir = args.out or (root / "viz")
     out_dir.mkdir(parents=True, exist_ok=True)
-    out = out_dir / f"episode_{args.episode:06d}_robothand.mp4"
+    out = out_dir / f"robothand_{root.parent.name[:8]}_ep{args.episode:06d}.mp4"
     proc = subprocess.Popen(
         [str(ffb.ffmpeg), "-y", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "rgb24",
          "-s", f"{w*2}x{h}", "-r", str(args.fps), "-i", "-", "-c:v", "libx264",
