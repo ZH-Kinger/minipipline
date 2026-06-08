@@ -44,6 +44,34 @@ def build_episode_inputs(
     w2c_all = _invert_se3(merged.trajectory.cam_c2w)
     fov = (float(merged.intrinsics.hfov_deg), float(merged.intrinsics.vfov_deg))
 
+    # Layer 2.5: retarget the whole sequence once (stable per-hand Kabsch
+    # alignment / scale), then slice per episode below. Robust to failure —
+    # on any error the robot columns stay None → NaN (honest, never fabricated).
+    robot_qpos_all = robot_ee_all = None
+    if merged.hand_keypoints_world is not None:
+        try:
+            from ..config.retarget import RetargetConfig
+            from ..retarget import retarget_episode
+
+            rcfg = RetargetConfig.from_env()
+            if rcfg.enabled:
+                _r = retarget_episode(merged.hand_keypoints_world, merged.pred_kept,
+                                      rcfg, return_diagnostics=True)
+                robot_qpos_all = _r["robot_qpos"]
+                robot_ee_all = _r["robot_ee_pose"]
+                # Honest quality summary (mm / %) — surfaced, never hidden.
+                for hand, d in _r["diag"].items():
+                    errs = d["fingertip_err_mm"]
+                    if errs:
+                        print(f"  [retarget] {hand}: {d['n_valid']} frames | "
+                              f"fingertip {np.mean(errs):.1f}mm (max {np.max(errs):.1f}) | "
+                              f"align {d['align_residual_mm']:.1f}mm | "
+                              f"scale {d['scale']:.2f} | "
+                              f"limit_ok {np.mean(d['limit_ok'])*100:.0f}%")
+        except Exception as exc:  # pragma: no cover - defensive
+            print(f"  [warn] retarget skipped ({type(exc).__name__}: {exc}); "
+                  f"robot_qpos/ee will be NaN.")
+
     ann_by_idx: dict[int, ClipAnnotation] = {}
     if clip_annotations is not None:
         ann_by_idx = {c.clip_idx: c for c in clip_annotations}
@@ -88,6 +116,8 @@ def build_episode_inputs(
                 depth_source_video_path=depth_video_path,
                 imu_per_frame=(imu_per_frame[a:b] if imu_per_frame is not None else None),
                 contact_phase=(contact_phase[a:b] if contact_phase is not None else None),
+                robot_qpos=(robot_qpos_all[a:b] if robot_qpos_all is not None else None),
+                robot_ee_pose=(robot_ee_all[a:b] if robot_ee_all is not None else None),
             )
         )
     return episodes

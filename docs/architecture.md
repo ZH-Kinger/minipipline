@@ -149,6 +149,17 @@ world→camera 往返应复现原始相机系坐标，作为内置正确性自�
 
 **action 向量**（每帧 102 维）= 左手 51 + 右手 51，由 dataloader **即时计算**，不落盘。布局常量见 `ACTION_LAYOUT`。
 
+## Layer 2.5 — Retarget (`multimodal_pipeline.retarget`)
+
+把每帧**人手 MANO** 重定向到 **Wuji 机器人**，给数据集补上机器人可执行的动作目标，是接进 IL 训练闭环的关键一环。纯 numpy 实现（URDF 正向运动学 + Levenberg–Marquardt），无 pinocchio/nlopt/scipy，惰性导入，遵循仓库自检风格。
+
+- **手**：人手 21 关键点 → Wuji 灵巧手 **20 关节角**。先用关键点构造手腕局部系（去除全局位姿），再用 Kabsch 从整段平均手形**自标定** MANO↔Wuji 约定差与尺度（数据驱动，非硬编码），逐帧 vector 重定向匹配指尖（限位内、帧间平滑）。
+- **臂**：每臂 3 关节（`*_arm_joint1/2`、`*_palm_joint`）的欠驱动 IK 拟合手腕 6-DOF — 等 `dual_arm.urdf`（`wh120_arm_mujoco` 分支）到位后落地；在此之前臂列为 **NaN（诚实“未计算”）**。
+- **写入两列**（`schema.py`）：`observation.robot_qpos[46]`（左臂3+左手20+右臂3+右手20，全关节，可直接执行）+ `observation.robot_ee_pose[12]`（每手 transl3+orient_aa3，跨本体通用的末端位姿）。
+- **No-fake-data**：某手无真实关键点（mock 链）或该帧未 `kept` → 对应列 **NaN 填充**，与 `observation.hand_keypoints` 一致。
+- **MIT URDF** 随仓库分发于 `retarget/assets/wuji/`（FK 只需 URDF，不需 mesh）。`MMPIPE_WUJI_URDF_DIR` 可覆盖（指向含 dual-arm URDF 的目录即可重定向臂）。
+- **自检**：`mmpipe retarget-check <nir_dir>` 报每手指尖误差（mm）、对齐残差（mm）、限位合规率；`python3 -m multimodal_pipeline.retarget.selftest` 跑 FK/雅可比/往返断言。已验证（`00010a33`）：右手指尖 ~10mm、左手 ~16mm、限位 100%。
+
 ## 数据流契约速查
 
 | 阶段间 | 数据形态 |
@@ -157,6 +168,7 @@ world→camera 往返应复现原始相机系坐标，作为内置正确性自�
 | NIR → Layer 2 | 通过 `media_paths.json` 找回源视频 |
 | NIR → Layer 1.5 | 同上，外加可选 `list[AtomicAction]`（Layer 2 输出）作 clip 边界 |
 | Layer 2 → Layer 3 | `MergedPrediction (numpy)` + `list[AtomicAction]` |
+| Layer 2 → Layer 2.5 → Layer 3 | `merged.hand_keypoints_world` → `robot_qpos[46]` / `robot_ee_pose[12]`（NaN 当无真值） |
 | Layer 1.5 → Layer 3 | `list[ClipAnnotation]` → 写入 `task` 字段（per-clip 语言）+ data parquet 的 `action_label` / `action_score` 列 |
 | Layer 3 → 训练 | 标准 LeRobot v3 datasets API |
 
@@ -237,6 +249,7 @@ mmpipe lerobot <nir_dir>                      # Layer 2 + 3
 mmpipe doctor                                 # 自检 ffmpeg / 依赖 / backend / 凭据
 mmpipe info <dataset_root>                    # 摘要数据集（episodes/frames/sizes）
 mmpipe validate <dataset_root>                # 读回校验数据集合规
+mmpipe retarget-check <nir_dir>               # Layer 2.5：重定向到 Wuji 并报拟合质量（mm/%）
 ```
 
 ## 配置分层
@@ -245,6 +258,7 @@ mmpipe validate <dataset_root>                # 读回校验数据集合规
 multimodal_pipeline/config/                # 代码即配置（算法层）
 ├── settings.py                            # Settings 单例：读 .env，暴露 device/backend/weights/...
 ├── itw.py / handpose.py / annotate.py / lerobot.py    # 每层算法参数 dataclass（默认值入 git）
+├── retarget.py                            # Layer 2.5 重定向参数（URDF/平滑/迭代/尺度）
 ├── legacy.py                              # 老版 PipelineConfig（sensor-ETL）
 └── models/                                # 单模型算法超参 dataclass
     ├── geocalib.py / moge2.py / hawor_s1.py / megasam.py / hawor_s2.py
