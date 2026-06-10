@@ -17,11 +17,10 @@ from pathlib import Path
 import numpy as np
 import pyarrow.parquet as pq
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from multimodal_pipeline.viz_mano import render_mano_overlay
-from multimodal_pipeline.viz3d import render_world_synced, prefuse_world_cache
+from .mano import render_mano_overlay
+from .scene3d import render_world_synced, prefuse_world_cache
 
-_REPO = Path(__file__).resolve().parents[1]
+_REPO = Path(__file__).resolve().parents[2]
 OUT_ROOT = _REPO / "output"
 GALLERY = _REPO / "artifacts" / "gallery"
 # Number of sessions to sample (evenly spread). Pass "all" or a count as argv[1];

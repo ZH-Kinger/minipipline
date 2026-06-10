@@ -876,14 +876,14 @@ def _cmd_info(args: argparse.Namespace) -> int:
 
 
 def _cmd_visualize(args: argparse.Namespace) -> int:
-    from .visualize import visualize_dataset
+    from .viz.core import visualize_dataset
 
     root = Path(args.dataset_root)
     if not (root / "meta" / "info.json").exists():
         print(f"Not a LeRobot v3 dataset (missing {root / 'meta' / 'info.json'}).")
         return 1
     if getattr(args, "world", False):
-        from .viz3d import render_world_synced
+        from .viz.scene3d import render_world_synced
         out_dir = args.out or (root / "viz")
         eps = args.episode if args.episode else list(range(min(3, json.loads((root / "meta" / "info.json").read_text())["total_episodes"])))
         written = [render_world_synced(root, ep, out_dir) for ep in eps]
@@ -892,7 +892,7 @@ def _cmd_visualize(args: argparse.Namespace) -> int:
             print(f"  {p}")
         return 0
     if getattr(args, "threed", False):
-        from .viz3d import render_3d_video
+        from .viz.scene3d import render_3d_video
         out_dir = args.out or (root / "viz")
         eps = args.episode if args.episode else list(range(min(3, json.loads((root / "meta" / "info.json").read_text())["total_episodes"])))
         written = [render_3d_video(root, ep, out_dir) for ep in eps]
@@ -902,7 +902,7 @@ def _cmd_visualize(args: argparse.Namespace) -> int:
         return 0
 
     if args.mano or args.combined:
-        from .viz_mano import render_mano_overlay, render_combined
+        from .viz.mano import render_mano_overlay, render_combined
         out_dir = args.out or (root / "viz")
         eps = args.episode if args.episode else list(range(min(3, json.loads((root / "meta" / "info.json").read_text())["total_episodes"])))
         fn = render_combined if args.combined else render_mano_overlay

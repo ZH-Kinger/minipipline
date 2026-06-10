@@ -19,7 +19,7 @@ import numpy as np
 import pyarrow.parquet as pq
 from PIL import Image, ImageDraw
 
-from ._system import check_ffmpeg
+from .._system import check_ffmpeg
 
 # 21-keypoint MANO-style skeleton bones (index pairs into the per-hand block).
 # 0 wrist; 1-4 thumb; 5-8 index; 9-12 middle; 13-16 ring; 17-20 pinky.

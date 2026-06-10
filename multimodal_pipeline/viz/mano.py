@@ -30,8 +30,8 @@ from pathlib import Path
 
 import numpy as np
 
-from ._system import check_ffmpeg
-from .lerobot_v3.schema import STATE_LAYOUT
+from .._system import check_ffmpeg
+from ..lerobot_v3.schema import STATE_LAYOUT
 
 
 def _patch_numpy_for_chumpy() -> None:
@@ -269,7 +269,7 @@ def render_combined(dataset_root: Path, ep_idx: int, out_dir: Path, *,
     """
     from PIL import Image, ImageDraw
     import pyarrow.parquet as pq
-    from .visualize import (_decode_depth_gray16, _decode_rgb as _vd_rgb, _depth_to_rgb,
+    from .core import (_decode_depth_gray16, _decode_rgb as _vd_rgb, _depth_to_rgb,
                             _draw_hand, _draw_wrist_axes, _project, _BONES, _LEFT_COLOR, _RIGHT_COLOR)
     _patch_numpy_for_chumpy()
     import smplx
