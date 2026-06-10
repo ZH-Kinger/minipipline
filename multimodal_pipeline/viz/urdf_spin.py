@@ -16,8 +16,7 @@ os.environ.setdefault("MUJOCO_GL", "egl")
 import numpy as np
 import mujoco
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from multimodal_pipeline._system import check_ffmpeg  # noqa: E402
+from .._system import check_ffmpeg  # noqa: E402
 
 W, H, N = 640, 480, 150
 

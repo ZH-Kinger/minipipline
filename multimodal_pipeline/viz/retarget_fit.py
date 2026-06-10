@@ -17,12 +17,11 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from multimodal_pipeline.handpose import HandPoseConfig, run_handpose_pipeline  # noqa: E402
-from multimodal_pipeline.config.retarget import RetargetConfig  # noqa: E402
-from multimodal_pipeline.retarget.robot import RobotModel  # noqa: E402
-from multimodal_pipeline.retarget.optimize import kabsch_rotation, solve_hand_qpos  # noqa: E402
-from multimodal_pipeline.retarget.core import _human_fingertip_vectors  # noqa: E402
+from ..handpose import HandPoseConfig, run_handpose_pipeline  # noqa: E402
+from ..config.retarget import RetargetConfig  # noqa: E402
+from ..retarget.robot import RobotModel  # noqa: E402
+from ..retarget.optimize import kabsch_rotation, solve_hand_qpos  # noqa: E402
+from ..retarget.core import _human_fingertip_vectors  # noqa: E402
 
 FINGERS = ["thumb", "index", "middle", "ring", "pinky"]
 COLORS = ["#e6194B", "#3cb44b", "#4363d8", "#f58231", "#911eb4"]
@@ -62,7 +61,7 @@ def retarget_hand_debug(kp_seq, kept, model, cfg, max_frames=80):
 def main():
     nir = Path(sys.argv[1])
     out = Path(sys.argv[2]) if len(sys.argv) > 2 else (
-        Path(__file__).resolve().parents[1] / "artifacts" / "gallery" / f"retarget_{nir.name[:8]}.png")
+        Path(__file__).resolve().parents[2] / "artifacts" / "gallery" / f"retarget_{nir.name[:8]}.png")
     out.parent.mkdir(parents=True, exist_ok=True)
 
     res = run_handpose_pipeline(nir, HandPoseConfig.from_file(None))

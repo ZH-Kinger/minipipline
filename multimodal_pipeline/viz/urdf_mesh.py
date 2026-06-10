@@ -20,8 +20,7 @@ import matplotlib.pyplot as plt
 from matplotlib.colors import LightSource
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from multimodal_pipeline.retarget.urdf_fk import KinematicTree, _rpy_to_matrix, _homogeneous  # noqa: E402
+from ..retarget.urdf_fk import KinematicTree, _rpy_to_matrix, _homogeneous  # noqa: E402
 
 
 def _origin(e):

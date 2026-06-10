@@ -28,14 +28,13 @@ from pathlib import Path
 import numpy as np
 from PIL import Image, ImageDraw
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from multimodal_pipeline._system import check_ffmpeg  # noqa: E402
-from multimodal_pipeline.visualize import _decode_rgb, _project_pts  # noqa: E402
-from multimodal_pipeline.viz_mano import _intrinsics  # noqa: E402
-from multimodal_pipeline.lerobot_v3.schema import ROBOT_QPOS_LAYOUT  # noqa: E402
-from multimodal_pipeline.retarget.robot import RobotModel, MANO_FINGERTIPS  # noqa: E402
-from multimodal_pipeline.retarget.optimize import kabsch_rotation  # noqa: E402
-from multimodal_pipeline.retarget.core import _human_fingertip_vectors, _hand_basis  # noqa: E402
+from .._system import check_ffmpeg  # noqa: E402
+from .core import _decode_rgb, _project_pts  # noqa: E402
+from .mano import _intrinsics  # noqa: E402
+from ..lerobot_v3.schema import ROBOT_QPOS_LAYOUT  # noqa: E402
+from ..retarget.robot import RobotModel, MANO_FINGERTIPS  # noqa: E402
+from ..retarget.optimize import kabsch_rotation  # noqa: E402
+from ..retarget.core import _human_fingertip_vectors, _hand_basis  # noqa: E402
 
 _COL = {"left": (0, 180, 255), "right": (255, 140, 0)}
 _FMAP = (0, 1, 2, 3, 4)

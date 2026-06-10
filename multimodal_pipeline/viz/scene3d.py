@@ -18,11 +18,11 @@ from pathlib import Path
 
 import numpy as np
 
-from ._system import check_ffmpeg
-from .viz_mano import (
+from .._system import check_ffmpeg
+from .mano import (
     _check_mano_assets, _mano_vertices, _patch_numpy_for_chumpy, _resolve_mano_dir,
 )
-from .visualize import _decode_depth_gray16, _decode_rgb, _intrinsics
+from .core import _decode_depth_gray16, _decode_rgb, _intrinsics
 
 _MIR = np.array([1.0, -1.0, -1.0], dtype=np.float64)
 
@@ -673,7 +673,7 @@ def render_world_synced(dataset_root: Path, ep_idx: int, out_dir: Path, *,
     from open3d.visualization import rendering
     import pyarrow.parquet as pq
     from PIL import Image, ImageDraw
-    from .visualize import (_decode_rgb as _vd_rgb, _decode_depth_gray16, _BONES,
+    from .core import (_decode_rgb as _vd_rgb, _decode_depth_gray16, _BONES,
                             _draw_hand, _draw_wrist_axes, _project,
                             _LEFT_COLOR, _RIGHT_COLOR)
     _patch_numpy_for_chumpy()
