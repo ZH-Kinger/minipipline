@@ -1,10 +1,16 @@
-# 架构总览：通用多模态人类示范数据管线
+# 架构总览：人手示范 → 机器人策略 数据引擎
+
+## 这个项目本质是做什么的
+
+一句话：**把人在真实世界里徒手做操作的视频，自动加工成机器人（Wuji 五指灵巧手）可以直接拿去做模仿学习训练的数据集，并训出一个策略验证这条链路真的走通。**
+
+为什么值得做：机器人操作数据极贵（要真机遥操作采集），而人手视频采集成本几乎为零。本项目就是把「人怎么做」自动翻译成「机器人该输出什么动作」的那根管子——一个廉价的机器人数据水龙头。
 
 ## 设计目标
 
-将 ITW（In-The-Wild）人类示范会话原始数据，端到端转换为可直接用于 VLA/模仿学习训练的 LeRobot v3 标准数据集。
+将 ITW（In-The-Wild）人类示范会话原始数据，端到端转换为可直接用于 VLA/模仿学习训练的 LeRobot v3 标准数据集，并闭环到一个可训练、可 rollout 的策略。
 
-## 4 层叠加架构
+## 分层叠加架构
 
 ```
 原始 ITW 会话目录
@@ -19,21 +25,62 @@
   AtomicActions                 FrameQualityRow
   （real_ingest | mock）         （mock | dashscope | rule_based）
        │                              │
+       ▼  Layer 2.5 (retarget)        │
+  人手 MANO → Wuji 机器人            │
+  robot_qpos[46] / ee_pose[12]      │
+       │                              │
        └──────────────┬───────────────┘
                       ▼
             Layer 3 (lerobot_v3)
             LeRobot v3 数据集
-            （tasks 来自 clip 语言，
-              data 含 action_label/score 列）
+      （state[122] + robot_qpos/ee，
+        tasks 来自 clip 语言，
+        data 含 action_label/score 列）
+                      │
+                      ▼  Layer 4 (il)
+            lerobot ACT policy
+      （从 ego 图像预测单手 Wuji 动作 26-D，
+        val≈0.04；rollout / analyze 可视化）
+
+    （贯穿全线：multimodal_pipeline.viz —— 叠加/3D/看板可视化）
 ```
 
 每层有**独立的输入输出契约**，可以独立替换实现：
 - Layer 1 未来可加 USD/Omniverse 导出
 - Layer 2 接入真实 GeoCalib / MoGe-2 / HaWoR / MegaSAM 模型权重时不影响上下游
 - Layer 1.5 可换 VLM（Qwen-VL / GPT-4o / 本地模型），可替换 quality（OpenCV / 训练分类器）
+- Layer 2.5 换机器人只需换 URDF（`MMPIPE_WUJI_URDF_DIR`），FK/IK 与上下游解耦
 - Layer 3 输出格式可以从 LeRobot v3 切换到 RLDS / WebDataset / 任意其他格式
+- Layer 4 策略可从 ACT 换成 Diffusion Policy / 任意 lerobot policy
 
 **Layer 2 与 Layer 1.5 都直接消费 NIR，互相独立**。当 atomic_actions 来自 Layer 2 时，Layer 1.5 把它们当作 clip 边界打标（语义对齐）；若 Layer 2 没跑，Layer 1.5 退化为按固定窗口切 clip。
+
+## 仓库目录结构
+
+```
+minipipline/
+├── main.py                        # 入口薄壳 → multimodal_pipeline.cli:main
+├── pyproject.toml                 # 包元数据 + mmpipe console_script
+├── multimodal_pipeline/
+│   ├── cli.py                     # argparse CLI（run-all / ingest / ... / visualize）
+│   ├── __main__.py                # python -m multimodal_pipeline 入口
+│   ├── config/                    # 代码即配置（settings 单例 + 每层 dataclass + models/）
+│   ├── itw/                       # Layer 1：ITW → NIR（discover/validate/calib/align/normalize/pack）
+│   ├── handpose/                  # Layer 2：NIR → MergedPrediction（real_ingest / mock 模型链）
+│   ├── annotate/                  # Layer 1.5：NIR → 语言/动作标签 + 帧质量
+│   ├── retarget/                  # Layer 2.5：人手 MANO → Wuji（纯 numpy FK+LM；assets/wuji/ 存 URDF）
+│   ├── lerobot_v3/                # Layer 3：打 LeRobot v3 数据集（schema/writer/validate/actions）
+│   ├── il/                        # Layer 4：lerobot ACT 训练（dataset/train/rollout/analyze/live_plot）
+│   ├── viz/                       # 可视化子包（overlay/scene3d/mano/robot_overlay/dashboard/gallery）
+│   ├── quality.py                 # 4 维数据质量报告（run-all 末尾自动跑）
+│   └── pipeline.py/stages.py/records.py + config/legacy.py   # 遗留 sensor-ETL（隐藏命令 run/init-config）
+├── docs/                          # 本文档 + MIGRATION + adr/
+├── examples/configs/              # JSON 配置模板（--*-config 可选覆盖）
+└── scripts/create_demo_data.py    # 造演示数据
+```
+
+> `.venv/`、`.idea/`、`output/`、`artifacts/`、`models/`（MANO 授权资产）、`.env`（真实凭据）、
+> `*_synthetic.urdf`（占位臂）均已在 `.gitignore` 中，不入库。
 
 ## Layer 1 — ITW Ingest (`multimodal_pipeline.itw`)
 
@@ -149,7 +196,11 @@ world→camera 往返应复现原始相机系坐标，作为内置正确性自�
 
 **action 向量**（每帧 102 维）= 左手 51 + 右手 51，由 dataloader **即时计算**，不落盘。布局常量见 `ACTION_LAYOUT`。
 
+**说明**：Layer 3 落盘的是**人手** state/action（MANO 系）；机器人可执行的动作目标由 Layer 2.5 追加为 `robot_qpos` / `robot_ee_pose` 两列（见下）。Layer 4 训练消费的正是这两列。
+
 ## Layer 2.5 — Retarget (`multimodal_pipeline.retarget`)
+
+（按数据流位于 Layer 2 与 Layer 3 之间：Layer 2 出人手 MANO → 本层重定向到机器人 → Layer 3 打包时把机器人列一并落盘。）
 
 把每帧**人手 MANO** 重定向到 **Wuji 机器人**，给数据集补上机器人可执行的动作目标，是接进 IL 训练闭环的关键一环。纯 numpy 实现（URDF 正向运动学 + Levenberg–Marquardt），无 pinocchio/nlopt/scipy，惰性导入，遵循仓库自检风格。
 
@@ -159,6 +210,54 @@ world→camera 往返应复现原始相机系坐标，作为内置正确性自�
 - **No-fake-data**：某手无真实关键点（mock 链）或该帧未 `kept` → 对应列 **NaN 填充**，与 `observation.hand_keypoints` 一致。
 - **MIT URDF** 随仓库分发于 `retarget/assets/wuji/`（FK 只需 URDF，不需 mesh）。`MMPIPE_WUJI_URDF_DIR` 可覆盖（指向含 dual-arm URDF 的目录即可重定向臂）。
 - **自检**：`mmpipe retarget-check <nir_dir>` 报每手指尖误差（mm）、对齐残差（mm）、限位合规率；`python3 -m multimodal_pipeline.retarget.selftest` 跑 FK/雅可比/往返断言。已验证（`00010a33`）：右手指尖 ~10mm、左手 ~16mm、限位 100%。
+
+## Layer 4 — IL 训练 (`multimodal_pipeline.il`)
+
+闭环的最后一环：直接读 Layer 3 产出的 LeRobot v3 数据集，训一个 **lerobot ACT 策略**，用 ego 图像 + 当前手部状态预测未来的 Wuji 手动作，验证「人手数据 → 可训练策略」这条链真的通。
+
+**样本定义**（`dataset.py`）：一个样本 = 一个 (kept 手 × 帧)。观测 = ego 图像 + 该手当前 **26-D** 配置 `[hand_qpos 20 + ee transl3 + ee orient_aa3]`（只取手 + 末端，排除占位臂）；目标 = 同一 26-D 配置的 ACT 式**未来 chunk**（默认 16 步，pad 掩码补齐）。含 NaN（未 kept / 占位臂）的手/帧直接丢弃——延续 no-fake-data。每 episode 解码一次 ego 视频，帧在 RAM 缓存、双手去重。
+
+**训练**（`train.py`）：
+
+| 组件 | 选择 | 说明 |
+|------|------|------|
+| policy | lerobot 0.4.4 `ACTPolicy` | resnet18 视觉 backbone，chunk=16 |
+| VAE | **关闭**（`use_vae=False`） | 规避此 build 的 VAE-in-eval KL 崩溃，退化为纯 transformer BC |
+| 归一化 | 自己在 collate 里做 | state/action 用数据集 mean-std，图像用 ImageNet；policy 的 `normalization_mapping` 设 IDENTITY（此 build 的 ACT 不内部归一、不吃 stats）。保存 policy state_dict + norm stats（rollout 反归一化要用）|
+| 评估 | `_eval_per_dof` | 用 `predict_action_chunk[:,0]` 干净单步预测算逐关节 mean-abs 误差（避开 select_action 的 chunk 队列在乱序 batch 上把误差放大 10× 的坑）|
+
+**监控可视化**：
+- `il_train_curve.png` —— 训练中每 50 步覆盖重画的 loss 曲线（VS Code 图片预览自动刷新）+ 结束时逐 DoF 误差柱状图。
+- **TensorBoard**（`--tb`，默认开）—— events 写到 `<out>/tb/`；VS Code `Python: Launch TensorBoard` 可在编辑器标签页内实时看 `loss/train`、`loss/val`（可缩放/平滑/悬停）。
+- `analyze.py` —— 自解释分析图（`il_analysis.png`）：训练曲线 + 判词（收敛/过拟合/欠拟合）、误差 vs 数据量、误差分布、逐 DoF 难度，一眼回答「策略多好、瓶颈系于什么」。
+- `live_plot.py` —— `plt.ion` 真窗口实时曲线（**需自己在有显示的终端跑**，detached shell 弹不出 GUI）。
+- `rollout.py` —— 开环 rollout，渲染预测 vs GT 的 Wuji 手骨架 MP4。
+
+**实测**：val loss ≈ 0.042，rollout MSE ≈ 0.0006，逐关节 mean-abs 误差 ≈ 0.018 rad。
+
+**运行**（无 CLI 子命令，走模块）：
+```bash
+python3 -m multimodal_pipeline.il.train    --sessions 8 --epochs 8   # 训练（默认 artifacts/il）
+python3 -m multimodal_pipeline.il.rollout                            # 预测 vs GT 骨架 MP4
+python3 -m multimodal_pipeline.il.analyze  --sessions 4              # 自解释分析图
+python3 -m multimodal_pipeline.il.live_plot                          # 自己终端里的实时曲线窗口
+```
+
+## 可视化 (`multimodal_pipeline.viz`)
+
+横切所有层的可视化子包（`mmpipe visualize` 与 `il`/`retarget` 复用），供人工核查拟合质量：
+
+| 模块 | 作用 |
+|------|------|
+| `core.py` | 关键点叠加 MP4（可选 depth / raw 对比 / 点云）——`mmpipe visualize` 默认路径 |
+| `mano.py` | MANO 手网格叠加 PNG / 2×2 合成 MP4（`--mano` / `--all`） |
+| `scene3d.py` | Open3D/EGL 3D 视频（`--3d`）+ 帧锁 3×2 全景 world MP4（`--world`） |
+| `robot_overlay.py` | 每帧 Umeyama 相似变换把 Wuji 手投影**叠加到 RGB 真手上**（自检 = 指尖像素距离）|
+| `retarget_fit.py` | 人手↔机器人指尖 3D 拟合对照 |
+| `urdf_mesh.py` / `urdf_spin.py` / `synth_arm.py` | URDF 网格加载 / 旋转展示 / 占位臂可视 |
+| `gallery.py` / `dashboard.py` | 扫 `artifacts/gallery/` 生成 `index.html` 看板，VS Code Live Preview 内打开看全部 mp4/png |
+
+> **GUI 限制**：detached shell 弹不出持久 GUI 窗口。要交互看的（mujoco viewer、live_plot、TensorBoard 面板）都在**用户自己的终端/VS Code** 里开；我这边产出的是文件（MP4/PNG/HTML）。
 
 ## 数据流契约速查
 
@@ -250,6 +349,12 @@ mmpipe doctor                                 # 自检 ffmpeg / 依赖 / backend
 mmpipe info <dataset_root>                    # 摘要数据集（episodes/frames/sizes）
 mmpipe validate <dataset_root>                # 读回校验数据集合规
 mmpipe retarget-check <nir_dir>               # Layer 2.5：重定向到 Wuji 并报拟合质量（mm/%）
+mmpipe visualize <dataset_root> [--all|--world|--mano|--3d]   # 可视化核查
+
+# Layer 4 IL 训练（无子命令，走模块）
+python3 -m multimodal_pipeline.il.train --sessions 8 --epochs 8
+python3 -m multimodal_pipeline.il.rollout
+python3 -m multimodal_pipeline.il.analyze
 ```
 
 ## 配置分层
