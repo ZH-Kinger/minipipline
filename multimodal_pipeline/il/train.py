@@ -24,6 +24,7 @@ from lerobot.policies.act.configuration_act import ACTConfig
 from lerobot.policies.act.modeling_act import ACTPolicy
 
 from .dataset import HAND_DIM, WujiActionDataset
+from .viz import render_training_curve
 
 _IMEAN = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
 _ISTD = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
@@ -96,6 +97,8 @@ def main():
     ap.add_argument("--lr", type=float, default=1e-4)
     ap.add_argument("--max-steps", type=int, default=0, help=">0 to cap steps (quick self-check)")
     ap.add_argument("--out", type=Path, default=Path("artifacts/il"))
+    ap.add_argument("--tb", action=argparse.BooleanOptionalAction, default=True,
+                    help="write TensorBoard events to <out>/tb (default on)")
     args = ap.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
     dev = "cuda"
@@ -116,6 +119,13 @@ def main():
     policy.train()
     opt = torch.optim.AdamW(policy.parameters(), lr=args.lr, weight_decay=1e-4)
 
+    writer = None
+    if args.tb:
+        from torch.utils.tensorboard import SummaryWriter
+        writer = SummaryWriter(str(args.out / "tb"))
+        print(f"tensorboard logdir: {args.out / 'tb'}  "
+              f"(VS Code: Ctrl+Shift+P → Python: Launch TensorBoard)")
+
     step = 0
     train_hist, val_hist, last_val = [], [], None
     for ep in range(args.epochs):
@@ -123,9 +133,14 @@ def main():
             gpu_batch = {k: v.to(dev) for k, v in batch.items()}
             loss, _ = policy.forward(gpu_batch)
             opt.zero_grad(); loss.backward(); opt.step(); step += 1
+            if writer:
+                writer.add_scalar("loss/train", loss.item(), step)
             if step % 50 == 0:
                 print(f"  step {step}  train_loss {loss.item():.4f}")
                 train_hist.append((step, loss.item()))
+                # live loss curve — overwrite each time; open it in VS Code and it
+                # auto-refreshes as training progresses.
+                render_training_curve(train_hist, val_hist, None, args.out / "il_train_curve.png")
             if args.max_steps and step >= args.max_steps:
                 break
         policy.eval(); vl = []
@@ -135,6 +150,8 @@ def main():
                 vl.append(policy.forward(gpu_batch)[0].item())
         policy.train()
         last_val = float(np.mean(vl)); val_hist.append((step, last_val))
+        if writer:
+            writer.add_scalar("loss/val", last_val, step)
         print(f"epoch {ep}  val_loss {last_val:.4f}  (step {step})")
         if args.max_steps and step >= args.max_steps:
             break
@@ -143,11 +160,15 @@ def main():
     np.savez(args.out / "stats.npz", state_mean=sm, state_std=ss, action_mean=am, action_std=asd)
     print(f"saved policy + stats to {args.out}")
 
-    # Auto-visualization: loss curve + per-DoF next-step error.
-    from .viz import render_training_curve
+    # Final visualization: loss curve + per-DoF next-step error.
     per_dof = _eval_per_dof(policy, vdl, am, asd, dev)
     curve = render_training_curve(train_hist, val_hist, per_dof,
                                   args.out / "il_train_curve.png", val_final=last_val)
+    if writer:
+        from .viz import _DOF_LABELS
+        for lbl, e in zip(_DOF_LABELS, per_dof):
+            writer.add_scalar(f"per_dof/{lbl}", float(e), 0)
+        writer.close()
     print(f"hand-joint mean abs err {per_dof[:20].mean():.4f} rad | wrote {curve}")
 
 
