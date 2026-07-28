@@ -151,8 +151,10 @@ minipipline/
 
 world→camera 往返应复现原始相机系坐标，作为内置正确性自检。实现见 `handpose/real_ingest.py`，编排器在 `MMPIPE_HANDPOSE_BACKEND=real_ingest` 时走 fast path 跳过模型链。
 
+**时序去抖（One-Euro，`handpose/smoothing.py`，默认开）**：源 tracker 逐帧独立出 MANO、无时序滤波(jerk/速度比 ~0.8，高频抖)。`smooth_merged` 用 1€ 滤波在**连续 kept 段内**去噪 `hand_keypoints_world` / `pred_trans` / `pred_rot` / `pred_hand_pose`——绝不跨 gap、绝不给非 kept 帧造值(守 no-fake-data)。向量场逐分量标量 1€；旋转场(手腕朝向 + 15 手指关节 axis-angle)用**四元数 1€ + SLERP** 球面低通(避开 axis-angle 的 2π wrap)。`pred_trans` 由滤后腕关键点派生保持一致，`pred_betas`(手形)不动。默认 `2.0/0.7`(00010a33 实测：pose jerk ×0.42、真实运动保留 ~2/3、Wuji 指尖拟合 6.59→6.00mm、限位 100%)。旋钮见 `config/handpose.py`；`smoothing_enabled=False` 关闭。自检：`python3 -m multimodal_pipeline.handpose.smoothing`。
+
 **输入**：NIR 会话目录。
-**输出**：`MergedPrediction`（视频级 MANO 参数 + 相机轨迹）+ `list[AtomicAction]`（基于手腕 3D 速度极小值切分）。
+**输出**：`MergedPrediction`（视频级 MANO 参数 + 相机轨迹，已去抖）+ `list[AtomicAction]`（基于手腕 3D 速度极小值切分，跑在去抖后的 `pred_trans` 上）。
 
 > **可选 mock backend（默认不启用）**：设 `MMPIPE_HANDPOSE_BACKEND=mock` 时，5 个模型后端通过 BLAKE2b 派生种子产生**确定性**随机张量（shape 与真实模型一致），仅用于在没有真实模型权重时调通链路。生产数据**不使用** mock。下方 7 阶段流水描述的是 mock / 未来真实模型链的拓扑；`real_ingest` 直接绕过它。
 
