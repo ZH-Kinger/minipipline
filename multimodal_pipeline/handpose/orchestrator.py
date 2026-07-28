@@ -141,6 +141,13 @@ def run_handpose_pipeline(
         merged = build_merged_from_nir(nir_dir, video)
         timings["real_ingest"] = time.perf_counter() - t
 
+        # Temporal de-jitter (1€ filter) before action segmentation so the
+        # velocity-minima split runs on smoothed wrist translation.
+        from .smoothing import smooth_merged
+        t = time.perf_counter()
+        merged = smooth_merged(merged, video.fps, cfg)
+        timings["smooth"] = time.perf_counter() - t
+
         t = time.perf_counter()
         atomic = []
         for idx, label in enumerate(label_segments):

@@ -51,6 +51,17 @@ class HandPoseConfig:
     max_invalid_run_frames: int = 5  # invalid runs longer than this dropped
     smoothing_window_frames: int = 5
 
+    # One-Euro temporal smoothing (real_ingest backend; applied only within
+    # continuous kept runs, never across gaps — denoise, never fabricate).
+    smoothing_enabled: bool = True
+    # "balanced" defaults (tuned on 00010a33): jerk ×0.42, velocity ×0.66,
+    # right-hand Wuji fingertip fit 6.59→6.00mm. See docs/architecture.md.
+    oneeuro_kp_min_cutoff: float = 2.0   # Hz — translation + 21 keypoints
+    oneeuro_kp_beta: float = 0.7
+    oneeuro_rot_min_cutoff: float = 2.0  # Hz — wrist orient + 15 finger joints
+    oneeuro_rot_beta: float = 0.7
+    oneeuro_d_cutoff: float = 1.0        # Hz — derivative/speed low-pass
+
     # Action segmentation.
     velocity_min_window: int = 5  # frames for local-minima detection
     velocity_min_eps: float = 1e-2
